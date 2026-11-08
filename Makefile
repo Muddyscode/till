@@ -6,7 +6,7 @@ test:
 	$(GO) test ./... -count=1 -timeout 180s
 
 test-race:
-	$(GO) test -race ./internal/ledger ./internal/httpserver ./tests/integration -count=1 -timeout 180s
+	$(GO) test -race ./... -count=1 -timeout 180s
 
 vet:
 	$(GO) vet ./...

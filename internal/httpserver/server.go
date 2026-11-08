@@ -97,10 +97,6 @@ func New(cfg config.Config, st *store.Store, log *slog.Logger) *Server {
 
 func (s *Server) Router() chi.Router { return s.router }
 
-func (s *Server) MountConsole(h http.Handler) {
-	s.router.Mount("/", h)
-}
-
 func (s *Server) poster() ledger.StorePoster {
 	return ledger.StorePoster{
 		LockAccounts:  s.store.LockAccounts,

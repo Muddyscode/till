@@ -15,5 +15,6 @@
 .DS_Store
 .superpowers/
 coverage.out
-/ledgerd
-/ledgerd.exe
+/tilld
+/tilld.exe
+.gotmp/
