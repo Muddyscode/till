@@ -23,7 +23,7 @@ func Post(ctx context.Context, tx pgx.Tx, st StorePoster, req PostRequest) (Jour
 	for i, l := range req.Lines {
 		ids[i] = l.AccountID
 	}
-	accts, err := st.LockAccounts(ctx, tx, req.OperatorID, ids)
+	accts, err := st.LockAccounts(ctx, tx, req.MerchantID, ids)
 	if err != nil {
 		return Journal{}, err
 	}
@@ -80,7 +80,7 @@ func Post(ctx context.Context, tx pgx.Tx, st StorePoster, req PostRequest) (Jour
 	}
 	j := Journal{
 		ID:                jid,
-		OperatorID:        req.OperatorID,
+		MerchantID:        req.MerchantID,
 		Status:            "posted",
 		Description:       req.Description,
 		IdempotencyKey:    req.IdempotencyKey,

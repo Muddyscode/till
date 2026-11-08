@@ -48,7 +48,7 @@ const (
 
 type Account struct {
 	ID            uuid.UUID
-	OperatorID    uuid.UUID
+	MerchantID    uuid.UUID
 	Code          string
 	Name          string
 	Type          AccountType
@@ -76,7 +76,7 @@ type Posting struct {
 
 type Journal struct {
 	ID                uuid.UUID
-	OperatorID        uuid.UUID
+	MerchantID        uuid.UUID
 	Status            string
 	Description       string
 	IdempotencyKey    string
@@ -86,7 +86,7 @@ type Journal struct {
 }
 
 type PostRequest struct {
-	OperatorID           uuid.UUID
+	MerchantID           uuid.UUID
 	Description          string
 	Lines                []Line
 	ReversesJournalID    *uuid.UUID

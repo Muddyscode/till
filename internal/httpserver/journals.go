@@ -4,9 +4,9 @@ import (
 	"encoding/json"
 	"net/http"
 
-	"github.com/Muddyscode/ledger-api/internal/ledger"
-	"github.com/Muddyscode/ledger-api/internal/money"
-	"github.com/Muddyscode/ledger-api/internal/store"
+	"github.com/Muddyscode/till/internal/ledger"
+	"github.com/Muddyscode/till/internal/money"
+	"github.com/Muddyscode/till/internal/store"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
@@ -120,13 +120,22 @@ func (s *Server) reverseJournal(w http.ResponseWriter, r *http.Request) {
 	if len(raw) == 0 {
 		raw = []byte(`{}`)
 	}
-	op := s.operator(r)
-	orig, err := s.store.GetJournal(r.Context(), s.store.Pool, op.ID, id)
+	op := s.staff(r)
+	orig, err := s.store.GetJournal(r.Context(), s.store.Pool, op.MerchantID, id)
 	if err != nil {
 		writeLedgerError(w, err)
 		return
 	}
-	if _, exists, err := s.store.ReversalOf(r.Context(), s.store.Pool, op.ID, orig.ID); err != nil {
+	used, err := s.store.JournalUsedByOrder(r.Context(), s.store.Pool, op.MerchantID, orig.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "internal error")
+		return
+	}
+	if used {
+		writeError(w, http.StatusConflict, ledger.CodeRefundViaOrder, "refund the order so stock is restored")
+		return
+	}
+	if _, exists, err := s.store.ReversalOf(r.Context(), s.store.Pool, op.MerchantID, orig.ID); err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", "internal error")
 		return
 	} else if exists {
@@ -137,10 +146,10 @@ func (s *Server) reverseJournal(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) postLines(w http.ResponseWriter, r *http.Request, key string, hash []byte, desc string, lines []ledger.Line, enforcePairs bool, reverses *uuid.UUID) {
-	op := s.operator(r)
+	op := s.staff(r)
 	var result txResult
 	err := s.withTx(r.Context(), func(tx pgx.Tx) error {
-		rec, err := s.store.ClaimIdempotency(r.Context(), tx, op.ID, key, hash)
+		rec, err := s.store.ClaimIdempotency(r.Context(), tx, op.MerchantID, key, hash)
 		if err != nil {
 			return err
 		}
@@ -149,7 +158,7 @@ func (s *Server) postLines(w http.ResponseWriter, r *http.Request, key string, h
 			return nil
 		}
 		j, err := ledger.Post(r.Context(), tx, s.poster(), ledger.PostRequest{
-			OperatorID:           op.ID,
+			MerchantID:           op.MerchantID,
 			Description:          desc,
 			Lines:                lines,
 			ReversesJournalID:    reverses,
@@ -163,7 +172,7 @@ func (s *Server) postLines(w http.ResponseWriter, r *http.Request, key string, h
 		if err != nil {
 			return err
 		}
-		if err := s.store.CompleteIdempotency(r.Context(), tx, op.ID, key, http.StatusCreated, body, j.ID); err != nil {
+		if err := s.store.CompleteIdempotency(r.Context(), tx, op.MerchantID, key, http.StatusCreated, body, &j.ID); err != nil {
 			return err
 		}
 		result = txResult{status: http.StatusCreated, body: body}
@@ -191,7 +200,7 @@ func (s *Server) getJournal(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	j, err := s.store.GetJournal(r.Context(), s.store.Pool, s.operator(r).ID, id)
+	j, err := s.store.GetJournal(r.Context(), s.store.Pool, s.staff(r).MerchantID, id)
 	if err != nil {
 		writeLedgerError(w, err)
 		return
@@ -209,7 +218,7 @@ func (s *Server) listTransfers(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) listJournalKind(w http.ResponseWriter, r *http.Request, twoLegged bool) {
 	limit := limitParam(r, 50, 200)
-	js, err := s.store.ListJournals(r.Context(), s.store.Pool, s.operator(r).ID, limit, twoLegged)
+	js, err := s.store.ListJournals(r.Context(), s.store.Pool, s.staff(r).MerchantID, limit, twoLegged)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", "internal error")
 		return

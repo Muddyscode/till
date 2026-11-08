@@ -43,6 +43,26 @@ func TestParseJSONAmountRejectsFloatThatWouldPassAtoi(t *testing.T) {
 	}
 }
 
+func TestParseOptionalKoboAllowsZero(t *testing.T) {
+	n, err := ParseOptionalKobo(nil)
+	if err != nil || n != 0 {
+		t.Fatalf("omitted: %d %v", n, err)
+	}
+	n, err = ParseOptionalKobo(json.RawMessage("0"))
+	if err != nil || n != 0 {
+		t.Fatalf("zero: %d %v", n, err)
+	}
+	n, err = ParseOptionalKobo(json.RawMessage("1500"))
+	if err != nil || n != 1500 {
+		t.Fatalf("positive: %d %v", n, err)
+	}
+	for _, c := range []string{`10.5`, `"0"`, `-1`, `1e2`} {
+		if _, err := ParseOptionalKobo(json.RawMessage(c)); err == nil {
+			t.Fatalf("expected error for %s", c)
+		}
+	}
+}
+
 func TestFormatNGN(t *testing.T) {
 	cases := map[int64]string{
 		0:       "₦0.00",

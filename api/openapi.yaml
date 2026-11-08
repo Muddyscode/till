@@ -1,223 +1,1226 @@
 openapi: 3.0.3
 info:
-  title: Ledger API
+  title: Till
   version: 1.0.0
   description: |
-    Double-entry ledger. Amounts are integer kobo (NGN). Posted journals are immutable.
-    Transfers require the Idempotency-Key header.
+    POS ledger and inventory API for one merchant with many outlets.
+    Money is integer kobo (NGN). Stock quantities are integers.
+    A cash sale deducts stock and posts a balanced journal in one Postgres transaction.
+    A transfer reserves stock until a signed Paystack-style webhook posts the sale.
+    A wallet sale spends store credit held as a liability of this merchant. It is not a licensed e-money wallet.
+    Average cost, cost of goods, and an order-level discount are part of that same transaction.
+    There is no public registration. Staff log in with a role of admin, manager, or cashier.
+
 servers:
-  - url: http://localhost:8080
+  - url: http://127.0.0.1:8080
+
+tags:
+  - name: Health
+  - name: Auth
+  - name: Outlets
+  - name: Products
+  - name: Stock
+  - name: Customers
+  - name: Orders
+  - name: Payments
+  - name: Reports
+  - name: Audit
+  - name: Staff
+  - name: Ledger
+
 paths:
   /v1/health:
     get:
-      summary: Liveness plus database ping
+      tags: [Health]
+      summary: Liveness and database ping
+      operationId: health
       responses:
         "200":
-          description: ok
-  /v1/auth/register:
-    post:
-      summary: Register an operator
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/Credentials"
-      responses:
-        "201":
-          description: created
+          description: Database is reachable
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: { type: string, example: ok }
+        "503":
+          $ref: "#/components/responses/Error"
+
   /v1/auth/login:
     post:
-      summary: Login
+      tags: [Auth]
+      summary: Log in a staff member
+      operationId: login
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/Credentials"
+              type: object
+              required: [email, password]
+              additionalProperties: false
+              properties:
+                email: { type: string, format: email }
+                password: { type: string }
       responses:
         "200":
-          description: token
+          description: Bearer token, valid for 12 hours
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [token, expires_at, staff]
+                properties:
+                  token: { type: string }
+                  expires_at: { type: string, format: date-time }
+                  staff: { $ref: "#/components/schemas/Staff" }
+        "401":
+          $ref: "#/components/responses/Error"
+
   /v1/auth/me:
     get:
-      security: [{bearerAuth: []}]
+      tags: [Auth]
+      summary: Current staff
+      operationId: me
+      security: [{ bearerAuth: [] }]
       responses:
         "200":
-          description: current operator
-  /v1/accounts:
+          description: Staff row. Password hash is never returned.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  staff: { $ref: "#/components/schemas/Staff" }
+        "401":
+          $ref: "#/components/responses/Error"
+
+  /v1/outlets:
     get:
-      security: [{bearerAuth: []}]
-      parameters:
-        - in: query
-          name: type
-          schema: {type: string, enum: [asset, liability, equity, income, expense]}
+      tags: [Outlets]
+      summary: List outlets the caller can use
+      operationId: listOutlets
+      security: [{ bearerAuth: [] }]
       responses:
         "200":
-          description: list
+          description: Admin sees every outlet of the merchant. Others see assigned outlets.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  outlets:
+                    type: array
+                    items: { $ref: "#/components/schemas/Outlet" }
     post:
-      security: [{bearerAuth: []}]
+      tags: [Outlets]
+      summary: Open an outlet and its cash and sales accounts
+      description: Admin only. Creates accounts `1000-{CODE}` and `4000-{CODE}`.
+      operationId: createOutlet
+      security: [{ bearerAuth: [] }]
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/CreateAccount"
+              type: object
+              required: [name, code]
+              additionalProperties: false
+              properties:
+                name: { type: string, example: Ikeja }
+                code:
+                  type: string
+                  pattern: "^[A-Z0-9]{2,8}$"
+                  example: IKJ
       responses:
         "201":
-          description: created
-  /v1/accounts/{id}:
+          description: Outlet created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Outlet" }
+        "400":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+        "409":
+          description: code_taken
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/products:
     get:
-      security: [{bearerAuth: []}]
-      parameters:
-        - $ref: "#/components/parameters/ID"
+      tags: [Products]
+      summary: List the merchant catalog
+      operationId: listProducts
+      security: [{ bearerAuth: [] }]
       responses:
         "200":
-          description: account
+          description: Products
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  products:
+                    type: array
+                    items: { $ref: "#/components/schemas/Product" }
+    post:
+      tags: [Products]
+      summary: Create a product
+      description: Admin or manager. price_minor is integer kobo. Unknown fields are rejected.
+      operationId: createProduct
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sku, name, price_minor]
+              additionalProperties: false
+              properties:
+                sku: { type: string, example: SERUM-C }
+                name: { type: string }
+                price_minor: { type: integer, minimum: 1, example: 850000 }
+                avg_cost_minor: { type: integer, minimum: 0, description: Opening average cost in kobo. Omit or 0 leaves the layer at zero until a receipt sets it. }
+                reorder_level: { type: integer, minimum: 0 }
+      responses:
+        "201":
+          description: Product created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Product" }
+        "400":
+          $ref: "#/components/responses/Error"
+        "409":
+          description: sku_taken
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/products/{id}:
+    patch:
+      tags: [Products]
+      summary: Change name, price, average cost, reorder level, or active flag
+      description: |
+        Admin or manager. A price change writes audit action product.price_changed.
+        Changing avg_cost_minor while units are on hand posts the difference to inventory (1200)
+        and inventory adjustment (5200). An increase credits 5200, which is allowed to go negative.
+        That journal is not a cash transfer. A refund does not recompute the average.
+      operationId: patchProduct
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/id"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                name: { type: string }
+                price_minor: { type: integer, minimum: 1 }
+                avg_cost_minor: { type: integer, minimum: 0 }
+                reorder_level: { type: integer, minimum: 0 }
+                active: { type: boolean }
+      responses:
+        "200":
+          description: Updated product
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Product" }
+        "400":
+          $ref: "#/components/responses/Error"
         "404":
-          description: not found
-  /v1/accounts/{id}/statement:
-    get:
-      security: [{bearerAuth: []}]
-      parameters:
-        - $ref: "#/components/parameters/ID"
-      responses:
-        "200":
-          description: statement
-  /v1/accounts/{id}/close:
+          $ref: "#/components/responses/Error"
+
+  /v1/stock/receipts:
     post:
-      security: [{bearerAuth: []}]
-      parameters:
-        - $ref: "#/components/parameters/ID"
-      responses:
-        "200":
-          description: closed
-  /v1/transfers:
-    get:
-      security: [{bearerAuth: []}]
-      responses:
-        "200":
-          description: two-legged journals
-    post:
-      security: [{bearerAuth: []}]
-      parameters:
-        - $ref: "#/components/parameters/IdempotencyKey"
+      tags: [Stock]
+      summary: Receive units into an outlet
+      description: |
+        Admin or manager. Increases on_hand.
+        unit_cost_minor is optional integer kobo. Omit it and the current average is used, with no journal when that average is 0.
+        Explicit 0 pulls the weighted average down and books nothing.
+        A positive booked cost debits inventory (1200) and credits goods received (2150). It does not take cash from the drawer.
+      operationId: receiveStock
+      security: [{ bearerAuth: [] }]
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/Transfer"
-      responses:
-        "201":
-          description: posted
-  /v1/transfers/{id}:
-    get:
-      security: [{bearerAuth: []}]
-      parameters:
-        - $ref: "#/components/parameters/ID"
-      responses:
-        "200":
-          description: journal
-  /v1/journals:
-    get:
-      security: [{bearerAuth: []}]
+              type: object
+              required: [outlet_id, sku, qty]
+              additionalProperties: false
+              properties:
+                outlet_id: { type: string, format: uuid }
+                sku: { type: string }
+                qty: { type: integer, minimum: 1 }
+                unit_cost_minor: { type: integer, minimum: 0, description: Omit to keep the current average. Explicit 0 is allowed. }
+                delta: { type: integer, description: Not used on a receipt. }
+                reason: { type: string }
       responses:
         "200":
-          description: journals
+          description: New on_hand
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StockMove" }
+        "403":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+
+  /v1/stock/adjustments:
     post:
-      security: [{bearerAuth: []}]
-      parameters:
-        - $ref: "#/components/parameters/IdempotencyKey"
+      tags: [Stock]
+      summary: Adjust on_hand by a signed delta
+      description: |
+        Admin or manager. reason is required. delta 0 is rejected. The result cannot pass below reserved or below zero.
+        When the average cost is above zero, the same transaction debits or credits inventory at that average against account 5200.
+      operationId: adjustStock
+      security: [{ bearerAuth: [] }]
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/Journal"
-      responses:
-        "201":
-          description: posted
-  /v1/journals/{id}:
-    get:
-      security: [{bearerAuth: []}]
-      parameters:
-        - $ref: "#/components/parameters/ID"
+              type: object
+              required: [outlet_id, sku, delta, reason]
+              additionalProperties: false
+              properties:
+                outlet_id: { type: string, format: uuid }
+                sku: { type: string }
+                delta: { type: integer, example: -1 }
+                reason: { type: string, example: damaged bottle }
+                qty: { type: integer }
       responses:
         "200":
-          description: journal
-  /v1/journals/{id}/reversal:
+          description: New on_hand
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StockMove" }
+        "409":
+          description: insufficient_stock
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/customers:
+    get:
+      tags: [Customers]
+      summary: List customers and their store-credit balances
+      operationId: listCustomers
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: Customers, ordered by name
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  customers:
+                    type: array
+                    items: { $ref: "#/components/schemas/Customer" }
     post:
-      security: [{bearerAuth: []}]
-      parameters:
-        - $ref: "#/components/parameters/ID"
-        - $ref: "#/components/parameters/IdempotencyKey"
+      tags: [Customers]
+      summary: Create a customer
+      description: Any signed-in role, including a cashier. Phone is unique per merchant. This is store credit, not a bank account.
+      operationId: createCustomer
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, phone]
+              additionalProperties: false
+              properties:
+                name: { type: string, maxLength: 80 }
+                phone: { type: string, maxLength: 32, example: "08030001111" }
       responses:
         "201":
-          description: reversing journal posted
+          description: Customer created with a zero balance
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Customer" }
+        "409":
+          description: phone_taken
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/customers/{id}:
+    get:
+      tags: [Customers]
+      summary: Get one customer
+      operationId: getCustomer
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/id"
+      responses:
+        "200":
+          description: Customer
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Customer" }
+        "404":
+          $ref: "#/components/responses/Error"
+
+  /v1/customers/{id}/topups:
+    post:
+      tags: [Customers]
+      summary: Take cash and add store credit
+      description: |
+        Requires Idempotency-Key. Any signed-in role that can access the outlet.
+        One transaction debits outlet cash, credits customer wallet (2200), and increases customers.balance_minor.
+        The sum of those balances equals the wallet account.
+      operationId: topUpCustomer
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/id"
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [outlet_id, amount_minor]
+              additionalProperties: false
+              properties:
+                outlet_id: { type: string, format: uuid }
+                amount_minor: { type: integer, minimum: 1 }
+      responses:
+        "201":
+          description: Updated customer plus journal_id
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Customer"
+                  - type: object
+                    properties:
+                      journal_id: { type: string, format: uuid }
+        "409":
+          description: idempotency_conflict or idempotency_in_progress
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/orders:
+    get:
+      tags: [Orders]
+      summary: List orders
+      description: Admin may omit outlet_id. Manager and cashier must pass an outlet they can access.
+      operationId: listOrders
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/outletId"
+        - $ref: "#/components/parameters/limit"
+      responses:
+        "200":
+          description: Orders, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  orders:
+                    type: array
+                    items: { $ref: "#/components/schemas/Order" }
+    post:
+      tags: [Orders]
+      summary: Sell
+      description: |
+        Requires Idempotency-Key.
+        Cash deducts on_hand and posts the sale journal. Response 201, status paid.
+        Transfer increments reserved, status pending_payment, and posts nothing.
+        Wallet requires customer_id, spends store credit, and posts in the same transaction. The balance cannot go negative (409 insufficient_wallet).
+        discount_minor is optional integer kobo. Omit it or send 0 for no discount. It must be less than the shelf total. VAT is calculated on the amount the customer pays. The client cannot send a price.
+        When the average cost is above zero, the sale journal also debits cost of goods (5000) and credits inventory (1200). A discount does not reduce that cost.
+        Unknown JSON fields are rejected.
+      operationId: createOrder
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [outlet_id, payment_method, lines]
+              additionalProperties: false
+              properties:
+                outlet_id: { type: string, format: uuid }
+                payment_method: { type: string, enum: [cash, transfer, wallet] }
+                customer_id: { type: string, format: uuid, description: Required for wallet. Must be omitted for cash and transfer. }
+                discount_minor: { type: integer, minimum: 0, description: Order-level discount in kobo. Floats are rejected. }
+                lines:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: object
+                    required: [sku, qty]
+                    additionalProperties: false
+                    properties:
+                      sku: { type: string }
+                      qty: { type: integer, minimum: 1 }
+            example:
+              outlet_id: 00000000-0000-7000-8000-000000000001
+              payment_method: cash
+              lines:
+                - { sku: SERUM-C, qty: 1 }
+      responses:
+        "201":
+          description: Order created, or the stored response for the same key and body
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Order" }
+        "400":
+          $ref: "#/components/responses/Error"
+        "403":
+          description: outlet_forbidden
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: Outlet is not in this merchant, or SKU is unknown
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: insufficient_stock, insufficient_wallet, idempotency_conflict, or idempotency_in_progress
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/orders/{id}:
+    get:
+      tags: [Orders]
+      summary: Get one order
+      operationId: getOrder
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/id"
+      responses:
+        "200":
+          description: Order
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Order" }
+        "403":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+
+  /v1/orders/{id}/refund:
+    post:
+      tags: [Orders]
+      summary: Refund a paid order
+      description: Admin or manager. Restocks and reverses the sale journal in one transaction. A wallet sale also puts the paid amount back on the customer balance. The average cost is not recomputed. Requires Idempotency-Key. Body may be empty or {}.
+      operationId: refundOrder
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/id"
+        - $ref: "#/components/parameters/idempotencyKey"
+      responses:
+        "201":
+          description: Order status is refunded
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Order" }
+        "409":
+          $ref: "#/components/responses/Error"
+
+  /v1/webhooks/paystack:
+    post:
+      tags: [Payments]
+      summary: Mock Paystack charge.success
+      description: |
+        No bearer token. Header x-paystack-signature is hex HMAC-SHA512 of the raw body
+        using TILL_PAYSTACK_SECRET. Amount is integer kobo.
+        Only event charge.success can post a sale.
+        Bad signature is 401 and changes nothing.
+        Unknown reference, amount mismatch, or an order that is not pending_payment
+        returns 200 with status ignored and writes an audit row.
+      operationId: paystackWebhook
+      parameters:
+        - in: header
+          name: x-paystack-signature
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [event, data]
+              properties:
+                event: { type: string, example: charge.success }
+                data:
+                  type: object
+                  required: [id, reference, amount, currency, status]
+                  properties:
+                    id: { type: integer, minimum: 1, description: Paystack event id. Replay of the same id is idempotent. }
+                    reference: { type: string }
+                    amount: { type: integer, description: Kobo. Must equal the order total. }
+                    currency: { type: string, example: NGN }
+                    status: { type: string, example: success }
+      responses:
+        "200":
+          description: Paid order, or an ignored event
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/Order"
+                  - type: object
+                    properties:
+                      status: { type: string, example: ignored }
+                      reason: { type: string, example: amount_mismatch }
+        "401":
+          description: invalid signature
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/reports/daily-sales:
+    get:
+      tags: [Reports]
+      summary: Paid sales for one Lagos calendar day
+      description: Admin or manager. outlet_id is required for every role. Omit date to use today in Africa/Lagos. Refunded, pending, and expired orders are excluded. matches_books compares the order total with the asset and liability debits on those sale journals. Cost of goods is an expense debit and is not included. A wallet payment is a liability debit and is included.
+      operationId: dailySales
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/outletId"
+        - in: query
+          name: date
+          schema: { type: string, format: date }
+      responses:
+        "200":
+          description: Daily sales
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DailySales" }
+
+  /v1/reports/stock-on-hand:
+    get:
+      tags: [Reports]
+      summary: Stock at one outlet
+      description: Any signed-in role that can access the outlet. available is on_hand minus reserved.
+      operationId: stockOnHand
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/outletId"
+      responses:
+        "200":
+          description: Stock rows
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  outlet_id: { type: string, format: uuid }
+                  stock:
+                    type: array
+                    items: { $ref: "#/components/schemas/StockRow" }
+
+  /v1/reports/low-stock:
+    get:
+      tags: [Reports]
+      summary: Lines at or under the reorder level
+      description: Low when available (on_hand - reserved) is less than or equal to reorder_level.
+      operationId: lowStock
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/outletId"
+      responses:
+        "200":
+          description: Low lines
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  outlet_id: { type: string, format: uuid }
+                  low_stock:
+                    type: array
+                    items: { $ref: "#/components/schemas/StockRow" }
+
+  /v1/audit:
+    get:
+      tags: [Audit]
+      summary: Who did what, and when
+      description: Admin or manager. Admin may omit outlet_id. Manager must pass an outlet.
+      operationId: listAudit
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/outletId"
+        - $ref: "#/components/parameters/limit"
+      responses:
+        "200":
+          description: Audit events, append-only
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  events:
+                    type: array
+                    items: { $ref: "#/components/schemas/AuditEvent" }
+
+  /v1/staff:
+    get:
+      tags: [Staff]
+      summary: List staff
+      operationId: listStaff
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: Admin only
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  staff:
+                    type: array
+                    items: { $ref: "#/components/schemas/Staff" }
+    post:
+      tags: [Staff]
+      summary: Create staff
+      description: Admin only. Password minimum 12 characters. Manager and cashier need at least one outlet_id. Admin does not.
+      operationId: createStaff
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password, role]
+              additionalProperties: false
+              properties:
+                email: { type: string }
+                password: { type: string, minLength: 12 }
+                role: { type: string, enum: [admin, manager, cashier] }
+                outlet_ids:
+                  type: array
+                  items: { type: string, format: uuid }
+      responses:
+        "201":
+          description: The staff object itself. The password hash is not included.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Staff" }
+        "409":
+          description: email_taken
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/staff/{id}/disable:
+    post:
+      tags: [Staff]
+      summary: Disable a staff login
+      description: Admin only. The last active admin cannot be disabled.
+      operationId: disableStaff
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/id"
+      responses:
+        "200":
+          description: The disabled staff object
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Staff" }
+        "409":
+          description: last_admin
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
   /v1/invariants:
     get:
-      security: [{bearerAuth: []}]
-      summary: Chart identity (must be 0) and cache-vs-journal drift
+      tags: [Ledger]
+      summary: Double-entry identity
+      description: Admin only. holds is true when identity_minor is 0 and cache_drift is 0.
+      operationId: invariants
+      security: [{ bearerAuth: [] }]
       responses:
         "200":
-          description: proof
+          description: Identity
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  holds: { type: boolean }
+                  identity_minor: { type: integer }
+                  cache_drift: { type: integer }
+                  accounts: { type: integer }
+                  journals: { type: integer }
+
+  /v1/accounts:
+    get:
+      tags: [Ledger]
+      summary: Chart of accounts
+      operationId: listAccounts
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: Admin only
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accounts:
+                    type: array
+                    items: { $ref: "#/components/schemas/Account" }
+    post:
+      tags: [Ledger]
+      summary: Create an account
+      description: Admin only. Currency is NGN. Free-form accounts are for the books, not for the till screen.
+      operationId: createAccount
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AccountCreate"
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Account" }
+        "409":
+          description: code_taken
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/accounts/{id}:
+    get:
+      tags: [Ledger]
+      summary: Get an account
+      operationId: getAccount
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/id"
+      responses:
+        "200":
+          description: Account. Another merchant's id is 404.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Account" }
+
+  /v1/accounts/{id}/statement:
+    get:
+      tags: [Ledger]
+      summary: Statement with a running balance
+      operationId: accountStatement
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/id"
+      responses:
+        "200":
+          description: Statement
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+
+  /v1/accounts/{id}/close:
+    post:
+      tags: [Ledger]
+      summary: Close an account
+      description: Admin only. A closed account rejects new postings.
+      operationId: closeAccount
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/id"
+      responses:
+        "200":
+          description: Closed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Account" }
+
+  /v1/transfers:
+    post:
+      tags: [Ledger]
+      summary: Two-legged transfer
+      description: Admin only. Requires Idempotency-Key. Income cannot be the debit side except through a reversal.
+      operationId: postTransfer
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [debit_account_id, credit_account_id, amount_minor]
+              properties:
+                debit_account_id: { type: string, format: uuid }
+                credit_account_id: { type: string, format: uuid }
+                amount_minor: { type: integer, minimum: 1 }
+                description: { type: string }
+      responses:
+        "201":
+          description: Posted journal
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Journal" }
+        "409":
+          $ref: "#/components/responses/Error"
+    get:
+      tags: [Ledger]
+      summary: List transfers
+      operationId: listTransfers
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: Journals that are transfers
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  transfers:
+                    type: array
+                    items: { $ref: "#/components/schemas/Journal" }
+
+  /v1/transfers/{id}:
+    get:
+      tags: [Ledger]
+      summary: Get a transfer journal
+      operationId: getTransfer
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/id"
+      responses:
+        "200":
+          description: Journal
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Journal" }
+
+  /v1/journals:
+    post:
+      tags: [Ledger]
+      summary: Post a balanced journal
+      description: Admin only. Requires Idempotency-Key. 2 to 20 postings. Each account at most once. Debits must equal credits.
+      operationId: postJournal
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [postings]
+              properties:
+                description: { type: string }
+                postings:
+                  type: array
+                  items: { $ref: "#/components/schemas/PostingInput" }
+      responses:
+        "201":
+          description: Posted
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Journal" }
+        "400":
+          $ref: "#/components/responses/Error"
+    get:
+      tags: [Ledger]
+      summary: List journals
+      operationId: listJournals
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: Journals
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  journals:
+                    type: array
+                    items: { $ref: "#/components/schemas/Journal" }
+
+  /v1/journals/{id}:
+    get:
+      tags: [Ledger]
+      summary: Get a journal
+      operationId: getJournal
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/id"
+      responses:
+        "200":
+          description: Journal
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Journal" }
+
+  /v1/journals/{id}/reversal:
+    post:
+      tags: [Ledger]
+      summary: Reverse a journal by appending
+      description: Admin only. Requires Idempotency-Key. Does not update the original rows. A journal attached to an order returns 409 refund_via_order.
+      operationId: reverseJournal
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/id"
+        - $ref: "#/components/parameters/idempotencyKey"
+      responses:
+        "201":
+          description: Reversal journal
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Journal" }
+        "409":
+          description: refund_via_order or already_reversed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
 components:
   securitySchemes:
     bearerAuth:
       type: http
       scheme: bearer
       bearerFormat: JWT
+
   parameters:
-    ID:
+    id:
       in: path
       name: id
       required: true
-      schema: {type: string, format: uuid}
-    IdempotencyKey:
+      schema: { type: string, format: uuid }
+    outletId:
+      in: query
+      name: outlet_id
+      required: false
+      schema: { type: string, format: uuid }
+    limit:
+      in: query
+      name: limit
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+    idempotencyKey:
       in: header
       name: Idempotency-Key
       required: true
-      schema: {type: string, maxLength: 256}
+      schema: { type: string, maxLength: 256 }
+
+  responses:
+    Error:
+      description: Error
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
   schemas:
-    Credentials:
+    Error:
       type: object
-      required: [email, password]
+      required: [error]
       properties:
-        email: {type: string}
-        password: {type: string, minLength: 12}
-    CreateAccount:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string, example: insufficient_stock }
+            message: { type: string }
+
+    Staff:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        merchant_id: { type: string, format: uuid }
+        email: { type: string }
+        role: { type: string, enum: [admin, manager, cashier] }
+        disabled_at: { type: string, format: date-time, nullable: true }
+        created_at: { type: string, format: date-time }
+
+    Outlet:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        code: { type: string }
+        cash_account_id: { type: string, format: uuid }
+        sales_account_id: { type: string, format: uuid }
+        created_at: { type: string, format: date-time }
+
+    Product:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        sku: { type: string }
+        name: { type: string }
+        price_minor: { type: integer, description: Kobo }
+        avg_cost_minor: { type: integer, description: Weighted average cost in kobo }
+        reorder_level: { type: integer }
+        active: { type: boolean }
+        created_at: { type: string, format: date-time }
+
+    StockMove:
+      type: object
+      properties:
+        sku: { type: string }
+        outlet_id: { type: string, format: uuid }
+        on_hand: { type: integer }
+        avg_cost_minor: { type: integer, description: Present on a receipt }
+
+    StockRow:
+      type: object
+      properties:
+        sku: { type: string }
+        name: { type: string }
+        on_hand: { type: integer }
+        reserved: { type: integer }
+        available: { type: integer }
+        reorder_level: { type: integer }
+        price_minor: { type: integer }
+        avg_cost_minor: { type: integer }
+        value_minor: { type: integer, description: on_hand times average cost }
+        low_stock: { type: boolean, description: Present on the low-stock report }
+
+    OrderLine:
+      type: object
+      properties:
+        sku: { type: string }
+        qty: { type: integer }
+        unit_price_minor: { type: integer }
+        line_total_minor: { type: integer }
+
+    Order:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        outlet_id: { type: string, format: uuid }
+        status: { type: string, enum: [pending_payment, paid, expired, refunded] }
+        payment_method: { type: string, enum: [cash, transfer, wallet] }
+        customer_id: { type: string, format: uuid, description: Set only on a wallet sale }
+        reference: { type: string, example: IKJ-A1B2C3D4-000001 }
+        total_minor: { type: integer, description: Amount the customer pays, after discount }
+        vat_minor: { type: integer }
+        net_minor: { type: integer }
+        discount_minor: { type: integer }
+        cost_minor: { type: integer, description: Average cost times quantity, snapshotted at payment }
+        currency: { type: string, example: NGN }
+        lines:
+          type: array
+          items: { $ref: "#/components/schemas/OrderLine" }
+        journal_id: { type: string, format: uuid, description: Absent until the sale is posted }
+        expires_at: { type: string, format: date-time }
+        paid_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+
+    DailySales:
+      type: object
+      properties:
+        date: { type: string, format: date }
+        outlet_id: { type: string, format: uuid }
+        order_count: { type: integer }
+        total_minor: { type: integer }
+        vat_minor: { type: integer }
+        net_minor: { type: integer }
+        by_method:
+          type: array
+          items:
+            type: object
+            properties:
+              method: { type: string }
+              order_count: { type: integer }
+              total_minor: { type: integer }
+              vat_minor: { type: integer }
+              net_minor: { type: integer }
+        books_debit_minor: { type: integer }
+        matches_books: { type: boolean }
+
+    AuditEvent:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        staff_id: { type: string, format: uuid, nullable: true }
+        action: { type: string, example: order.paid }
+        entity_type: { type: string }
+        entity_id: { type: string, format: uuid }
+        outlet_id: { type: string, format: uuid, nullable: true }
+        metadata: { type: object, additionalProperties: true }
+        created_at: { type: string, format: date-time }
+
+    Customer:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        phone: { type: string }
+        balance_minor: { type: integer, description: Store credit in kobo. Cannot go below zero. }
+        created_at: { type: string, format: date-time }
+
+    Account:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        code: { type: string }
+        name: { type: string }
+        type: { type: string, enum: [asset, liability, equity, income, expense] }
+        currency: { type: string, example: NGN }
+        allow_negative: { type: boolean }
+        status: { type: string, enum: [open, closed] }
+        balance_minor: { type: integer }
+        created_at: { type: string, format: date-time }
+
+    AccountCreate:
       type: object
       required: [code, name, type]
       properties:
-        code: {type: string}
-        name: {type: string}
-        type: {type: string, enum: [asset, liability, equity, income, expense]}
-        allow_negative: {type: boolean}
-    Transfer:
+        code: { type: string }
+        name: { type: string }
+        type: { type: string, enum: [asset, liability, equity, income, expense] }
+        allow_negative: { type: boolean }
+
+    PostingInput:
       type: object
-      required: [debit_account_id, credit_account_id, amount_minor]
+      required: [account_id, direction, amount_minor]
       properties:
-        debit_account_id: {type: string, format: uuid}
-        credit_account_id: {type: string, format: uuid}
-        amount_minor:
-          type: integer
-          format: int64
-          minimum: 1
-          description: kobo; JSON integer only, never a float
-        description: {type: string}
+        account_id: { type: string, format: uuid }
+        direction: { type: string, enum: [debit, credit] }
+        amount_minor: { type: integer, minimum: 1 }
+
     Journal:
       type: object
-      required: [postings]
       properties:
-        description: {type: string}
+        id: { type: string, format: uuid }
+        description: { type: string }
+        created_at: { type: string, format: date-time }
+        reverses_journal_id: { type: string, format: uuid, nullable: true }
         postings:
           type: array
-          minItems: 2
-          maxItems: 20
           items:
             type: object
-            required: [account_id, direction, amount_minor]
             properties:
-              account_id: {type: string, format: uuid}
-              direction: {type: string, enum: [debit, credit]}
-              amount_minor: {type: integer, format: int64, minimum: 1}
+              id: { type: string, format: uuid }
+              account_id: { type: string, format: uuid }
+              direction: { type: string }
+              amount_minor: { type: integer }
+              currency: { type: string }

@@ -1,12 +1,15 @@
 package httpserver
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"strings"
 
-	"github.com/Muddyscode/ledger-api/internal/ledger"
+	"github.com/Muddyscode/till/internal/ledger"
 )
 
 type errorBody struct {
@@ -43,10 +46,11 @@ func statusFor(code string) int {
 		return http.StatusUnauthorized
 	case ledger.CodeNotFound:
 		return http.StatusNotFound
-	case ledger.CodeIdempotencyConflict, ledger.CodeIdempotencyInProgress, ledger.CodeAlreadyReversed, "already_closed":
+	case ledger.CodeIdempotencyConflict, ledger.CodeIdempotencyInProgress, ledger.CodeAlreadyReversed, "already_closed",
+		ledger.CodeInsufficientStock, ledger.CodeInsufficientWallet, ledger.CodeRefundViaOrder, "last_admin", "email_taken", "code_taken", "sku_taken", "phone_taken":
 		return http.StatusConflict
-	case "email_taken":
-		return http.StatusConflict
+	case ledger.CodeForbidden, ledger.CodeOutletForbidden:
+		return http.StatusForbidden
 	default:
 		return http.StatusBadRequest
 	}
@@ -65,6 +69,21 @@ func canonicalHash(raw []byte) []byte {
 	}
 	sum := sha256.Sum256(canon)
 	return sum[:]
+}
+
+func decodeStrict(raw []byte, dest any) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dest); err != nil {
+		return err
+	}
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("trailing json")
+		}
+		return err
+	}
+	return nil
 }
 
 func requireIdempotencyKey(w http.ResponseWriter, r *http.Request) (string, bool) {

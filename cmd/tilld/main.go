@@ -9,11 +9,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Muddyscode/ledger-api/internal/config"
-	"github.com/Muddyscode/ledger-api/internal/console"
-	"github.com/Muddyscode/ledger-api/internal/httpserver"
-	"github.com/Muddyscode/ledger-api/internal/seed"
-	"github.com/Muddyscode/ledger-api/internal/store"
+	"github.com/Muddyscode/till/internal/checkout"
+	"github.com/Muddyscode/till/internal/config"
+	"github.com/Muddyscode/till/internal/httpserver"
+	"github.com/Muddyscode/till/internal/seed"
+	"github.com/Muddyscode/till/internal/store"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -27,7 +27,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
 	if err != nil {
 		log.Error("database", "err", err)
@@ -42,18 +43,15 @@ func main() {
 	st := store.New(pool)
 
 	if cfg.Seed {
-		if err := seed.Run(ctx, st, seed.Spec{Email: cfg.SeedEmail, Password: cfg.SeedPassword}, log); err != nil {
+		if err := seed.Run(ctx, st, seed.Spec{Password: cfg.SeedPassword}, log); err != nil {
 			log.Error("seed", "err", err)
 			os.Exit(1)
 		}
 	}
 
-	api := httpserver.New(cfg, st, log)
-	if err := console.Mount(api.Router(), cfg, st); err != nil {
-		log.Error("console", "err", err)
-		os.Exit(1)
-	}
+	go checkout.RunSweeper(ctx, st, 30*time.Second)
 
+	api := httpserver.New(cfg, st, log)
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           httpserver.Handler(api),
@@ -74,8 +72,9 @@ func main() {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	cancel()
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
 	_ = srv.Shutdown(shutdownCtx)
 }
 

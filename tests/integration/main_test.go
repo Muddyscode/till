@@ -10,32 +10,61 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/Muddyscode/ledger-api/internal/config"
-	"github.com/Muddyscode/ledger-api/internal/httpserver"
-	"github.com/Muddyscode/ledger-api/internal/store"
+	"github.com/Muddyscode/till/internal/auth"
+	"github.com/Muddyscode/till/internal/config"
+	"github.com/Muddyscode/till/internal/httpserver"
+	"github.com/Muddyscode/till/internal/store"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 var testPool *pgxpool.Pool
 
-func TestMain(m *testing.M) {
-	dsn := os.Getenv("LEDGER_TEST_DATABASE_URL")
-	if dsn == "" {
-		dsn = "postgres://ledger:ledger@127.0.0.1:5432/ledger_test?sslmode=disable"
+var (
+	hashOnce sync.Once
+	hashVal  string
+	hashErr  error
+)
+
+func cachedHash(t *testing.T) string {
+	t.Helper()
+	hashOnce.Do(func() {
+		hashVal, hashErr = auth.HashPassword("change-me-now-12")
+	})
+	if hashErr != nil {
+		t.Fatal(hashErr)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	return hashVal
+}
+
+func TestMain(m *testing.M) {
+	dsn := os.Getenv("TILL_TEST_DATABASE_URL")
+	if dsn == "" {
+		dsn = "postgres://till:till@127.0.0.1:5432/till_test?sslmode=disable"
+	}
+	// This laptop is slow right after Postgres recovery. A 4s ping looks like a dead database.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	pool, err := pgxpool.New(ctx, dsn)
-	if err != nil || pool.Ping(ctx) != nil {
-		if os.Getenv("LEDGER_REQUIRE_DB") == "1" {
-			fmt.Fprintln(os.Stderr, "LEDGER_REQUIRE_DB=1 but postgres is unreachable:", dsn, err)
+	if err != nil {
+		if os.Getenv("TILL_REQUIRE_DB") == "1" {
+			fmt.Fprintln(os.Stderr, "TILL_REQUIRE_DB=1 but postgres is unreachable:", dsn, err)
 			os.Exit(1)
 		}
-		fmt.Fprintln(os.Stderr, "integration tests skipped: no postgres (set LEDGER_TEST_DATABASE_URL)")
+		fmt.Fprintln(os.Stderr, "integration tests skipped: no postgres (set TILL_TEST_DATABASE_URL)")
+		os.Exit(0)
+	}
+	if err = pool.Ping(ctx); err != nil {
+		if os.Getenv("TILL_REQUIRE_DB") == "1" {
+			fmt.Fprintln(os.Stderr, "TILL_REQUIRE_DB=1 but postgres ping failed:", err)
+			os.Exit(1)
+		}
+		fmt.Fprintln(os.Stderr, "integration tests skipped: no postgres (set TILL_TEST_DATABASE_URL)")
 		os.Exit(0)
 	}
 	if err := store.Migrate(context.Background(), pool); err != nil {
@@ -58,8 +87,9 @@ func startAPI(t *testing.T) *apiClient {
 	t.Helper()
 	st := store.New(testPool)
 	cfg := config.Config{
-		JWTSecret:     "test-secret-must-be-32-bytes-ok!",
-		AllowRegister: true,
+		JWTSecret:      "test-secret-must-be-32-bytes-ok!",
+		PaystackSecret: "test-paystack-secret",
+		HoldMinutes:    15,
 	}
 	api := httpserver.New(cfg, st, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	srv := httptest.NewServer(api.Router())
@@ -138,18 +168,41 @@ func decode(t *testing.T, res *http.Response, dest any) {
 
 func (c *apiClient) register() {
 	c.t.Helper()
-	email := fmt.Sprintf("op-%s@test.local", uuid.NewString()[:8])
-	res := c.do(http.MethodPost, "/v1/auth/register", map[string]string{
+	c.loginStaff("admin", nil)
+}
+
+func (c *apiClient) loginStaff(role string, outlets []string) string {
+	c.t.Helper()
+	st := store.New(testPool)
+	ctx := context.Background()
+	mid := uuid.Must(uuid.NewV7())
+	sid := uuid.Must(uuid.NewV7())
+	email := fmt.Sprintf("%s-%s@test.local", role, uuid.NewString()[:8])
+	err := st.WithTx(ctx, func(tx pgx.Tx) error {
+		if _, err := st.CreateMerchant(ctx, tx, mid, "Test Books", 0); err != nil {
+			return err
+		}
+		_, err := st.CreateStaff(ctx, tx, store.Staff{
+			ID: sid, MerchantID: mid, Email: email, PasswordHash: cachedHash(c.t), Role: role,
+		})
+		return err
+	})
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	_ = outlets
+	res := c.do(http.MethodPost, "/v1/auth/login", map[string]string{
 		"email": email, "password": "change-me-now-12",
 	}, nil)
 	var out struct {
 		Token string `json:"token"`
 	}
 	decode(c.t, res, &out)
-	if res.StatusCode != http.StatusCreated {
-		c.t.Fatalf("register %d", res.StatusCode)
+	if res.StatusCode != http.StatusOK || out.Token == "" {
+		c.t.Fatalf("login %d", res.StatusCode)
 	}
 	c.token = out.Token
+	return email
 }
 
 func (c *apiClient) createAccount(code, name, typ string) string {

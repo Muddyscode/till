@@ -5,121 +5,149 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/Muddyscode/ledger-api/internal/auth"
-	"github.com/Muddyscode/ledger-api/internal/ledger"
-	"github.com/Muddyscode/ledger-api/internal/store"
+	"github.com/Muddyscode/till/internal/auth"
+	"github.com/Muddyscode/till/internal/ledger"
+	"github.com/Muddyscode/till/internal/store"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 )
 
-const OpeningKobo int64 = 1_000_000
+const (
+	adminEmail = "admin@till.local"
+	ikejaCash  = int64(5_000_000)
+	sulCash    = int64(2_000_000)
+)
 
 type Spec struct {
-	Email    string
 	Password string
 }
 
 func Run(ctx context.Context, st *store.Store, spec Spec, log *slog.Logger) error {
+	if _, err := st.GetStaffByEmail(ctx, st.Pool, adminEmail); err == nil {
+		log.Info("seed already present", "email", adminEmail)
+		return nil
+	}
 	hash, err := auth.HashPassword(spec.Password)
 	if err != nil {
 		return err
 	}
-	id, err := uuid.NewV7()
-	if err != nil {
-		return err
-	}
-	op, err := st.CreateOperator(ctx, st.Pool, id, spec.Email, hash)
-	if err != nil {
-		var pgErr *pgconn.PgError
-		if errorsAsPg(err, &pgErr) && pgErr.Code == "23505" {
-			op, err = st.GetOperatorByEmail(ctx, st.Pool, spec.Email)
+	err = st.WithTx(ctx, func(tx pgx.Tx) error {
+		mid, err := uuid.NewV7()
+		if err != nil {
+			return err
+		}
+		merchant, err := st.CreateMerchant(ctx, tx, mid, "Adaeze Studio", 750)
+		if err != nil {
+			return err
+		}
+		merchant, err = st.EnsureBooks(ctx, tx, merchant.ID)
+		if err != nil {
+			return err
+		}
+		ikeja, err := makeOutlet(ctx, tx, st, merchant.ID, "Ikeja", "IKJ")
+		if err != nil {
+			return err
+		}
+		sul, err := makeOutlet(ctx, tx, st, merchant.ID, "Surulere", "SUL")
+		if err != nil {
+			return err
+		}
+		if err := addStaff(ctx, tx, st, merchant.ID, adminEmail, hash, auth.RoleAdmin, nil); err != nil {
+			return err
+		}
+		if err := addStaff(ctx, tx, st, merchant.ID, "manager.ikeja@till.local", hash, auth.RoleManager, []uuid.UUID{ikeja.ID}); err != nil {
+			return err
+		}
+		if err := addStaff(ctx, tx, st, merchant.ID, "cashier.ikeja@till.local", hash, auth.RoleCashier, []uuid.UUID{ikeja.ID}); err != nil {
+			return err
+		}
+		if err := addStaff(ctx, tx, st, merchant.ID, "cashier.surulere@till.local", hash, auth.RoleCashier, []uuid.UUID{sul.ID}); err != nil {
+			return err
+		}
+		type item struct {
+			sku, name   string
+			price, cost int64
+			reorder     int
+			ikeja, sul  int
+		}
+		catalog := []item{
+			{"SERUM-C", "Vitamin C serum", 850_000, 320_000, 2, 20, 20},
+			{"SHEA-500", "Shea moisturizer 500ml", 450_000, 180_000, 2, 20, 12},
+			{"TOWEL", "Face towel", 120_000, 40_000, 2, 30, 15},
+			{"SOAP", "Castile soap", 200_000, 70_000, 5, 3, 20},
+		}
+		var inventory int64
+		for _, it := range catalog {
+			pid, err := uuid.NewV7()
 			if err != nil {
 				return err
 			}
-		} else {
-			return err
-		}
-	}
-
-	type specAcct struct {
-		code, name string
-		typ        ledger.AccountType
-	}
-	chart := []specAcct{
-		{"1000", "Cash", ledger.Asset},
-		{"1010", "Settlement", ledger.Asset},
-		{"2000", "Wallet · Alice", ledger.Liability},
-		{"2010", "Wallet · Bob", ledger.Liability},
-		{"3000", "Opening equity", ledger.Equity},
-		{"4000", "Fee income", ledger.Income},
-		{"5000", "Operating expense", ledger.Expense},
-	}
-	for _, c := range chart {
-		aid, err := uuid.NewV7()
-		if err != nil {
-			return err
-		}
-		_, err = st.CreateAccount(ctx, st.Pool, ledger.Account{
-			ID:         aid,
-			OperatorID: op.ID,
-			Code:       c.code,
-			Name:       c.name,
-			Type:       c.typ,
-			Currency:   "NGN",
-			Status:     ledger.AccountOpen,
-		})
-		if err != nil {
-			var pgErr *pgconn.PgError
-			if errorsAsPg(err, &pgErr) && pgErr.Code == "23505" {
-				continue
+			p, err := st.CreateProduct(ctx, tx, store.Product{
+				ID: pid, MerchantID: merchant.ID, SKU: it.sku, Name: it.name,
+				PriceMinor: it.price, AvgCostMinor: it.cost, ReorderLevel: it.reorder, Active: true,
+			})
+			if err != nil {
+				return err
 			}
-			return err
+			// Quantity only. A receipt journal would book this stock a second time.
+			// The opening journal below is the one debit to inventory.
+			if _, err := st.ReceiveStock(ctx, tx, ikeja.ID, p.ID, it.ikeja); err != nil {
+				return err
+			}
+			if _, err := st.ReceiveStock(ctx, tx, sul.ID, p.ID, it.sul); err != nil {
+				return err
+			}
+			inventory += it.cost * int64(it.ikeja+it.sul)
 		}
-	}
-
-	n, err := st.CountPostings(ctx, st.Pool, op.ID)
-	if err != nil {
-		return err
-	}
-	if n > 0 {
-		log.Info("seed skipped opening journal; postings already exist", "operator", op.Email)
-		return nil
-	}
-
-	cash, err := st.GetAccountByCode(ctx, st.Pool, op.ID, "1000")
-	if err != nil {
-		return err
-	}
-	eq, err := st.GetAccountByCode(ctx, st.Pool, op.ID, "3000")
-	if err != nil {
-		return err
-	}
-
-	poster := ledger.StorePoster{
-		LockAccounts:  st.LockAccounts,
-		InsertJournal: st.InsertJournal,
-		InsertPosting: st.InsertPosting,
-		UpdateBalance: st.UpdateBalance,
-	}
-	err = st.WithTx(ctx, func(tx pgx.Tx) error {
-		_, err := ledger.Post(ctx, tx, poster, ledger.PostRequest{
-			OperatorID:  op.ID,
-			Description: "opening balances",
+		if merchant.EquityAccountID == nil || merchant.InventoryAccountID == nil {
+			return fmt.Errorf("seed: books are missing")
+		}
+		poster := ledger.StorePoster{
+			LockAccounts: st.LockAccounts, InsertJournal: st.InsertJournal,
+			InsertPosting: st.InsertPosting, UpdateBalance: st.UpdateBalance,
+		}
+		_, err = ledger.Post(ctx, tx, poster, ledger.PostRequest{
+			MerchantID:  merchant.ID,
+			Description: "opening float and inventory",
 			Lines: []ledger.Line{
-				{AccountID: cash.ID, Direction: ledger.Debit, Amount: OpeningKobo},
-				{AccountID: eq.ID, Direction: ledger.Credit, Amount: OpeningKobo},
+				{AccountID: ikeja.CashAccountID, Direction: ledger.Debit, Amount: ikejaCash},
+				{AccountID: sul.CashAccountID, Direction: ledger.Debit, Amount: sulCash},
+				{AccountID: *merchant.InventoryAccountID, Direction: ledger.Debit, Amount: inventory},
+				{AccountID: *merchant.EquityAccountID, Direction: ledger.Credit, Amount: ikejaCash + sulCash + inventory},
 			},
 		})
 		return err
 	})
 	if err != nil {
-		return fmt.Errorf("seed opening journal: %w", err)
+		return fmt.Errorf("seed: %w", err)
 	}
-	log.Info("seeded demo book", "email", spec.Email, "opening_kobo", OpeningKobo)
+	log.Info("seeded Adaeze Studio", "email", adminEmail)
 	return nil
 }
 
-func errorsAsPg(err error, target **pgconn.PgError) bool {
-	return store.IsUnique(err, target)
+func makeOutlet(ctx context.Context, tx pgx.Tx, st *store.Store, merchantID uuid.UUID, name, code string) (store.Outlet, error) {
+	id, err := uuid.NewV7()
+	if err != nil {
+		return store.Outlet{}, err
+	}
+	return st.CreateOutlet(ctx, tx, id, merchantID, name, code)
+}
+
+func addStaff(ctx context.Context, tx pgx.Tx, st *store.Store, merchantID uuid.UUID, email, hash, role string, outlets []uuid.UUID) error {
+	id, err := uuid.NewV7()
+	if err != nil {
+		return err
+	}
+	created, err := st.CreateStaff(ctx, tx, store.Staff{
+		ID: id, MerchantID: merchantID, Email: email, PasswordHash: hash, Role: role,
+	})
+	if err != nil {
+		return err
+	}
+	for _, oid := range outlets {
+		if err := st.AssignStaffOutlet(ctx, tx, created.ID, oid); err != nil {
+			return err
+		}
+	}
+	return nil
 }

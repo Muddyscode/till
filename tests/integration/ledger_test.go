@@ -21,13 +21,13 @@ func TestHealth(t *testing.T) {
 	decode(t, res, nil)
 }
 
-func TestRegisterAndRejectShortPassword(t *testing.T) {
+func TestRegisterIsGone(t *testing.T) {
 	c := startAPI(t)
 	res := c.do(http.MethodPost, "/v1/auth/register", map[string]string{
-		"email": "short@test.local", "password": "too-short",
+		"email": "short@test.local", "password": "change-me-now-12",
 	}, nil)
-	if res.StatusCode != 400 {
-		t.Fatalf("got %d", res.StatusCode)
+	if res.StatusCode != 404 {
+		t.Fatalf("register still mounted: %d", res.StatusCode)
 	}
 	decode(t, res, nil)
 }

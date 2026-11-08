@@ -8,9 +8,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Muddyscode/ledger-api/internal/auth"
-	"github.com/Muddyscode/ledger-api/internal/ledger"
+	"github.com/Muddyscode/till/internal/auth"
+	"github.com/Muddyscode/till/internal/ledger"
+	"github.com/Muddyscode/till/internal/store"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
@@ -19,17 +21,91 @@ type creds struct {
 	Password string `json:"password"`
 }
 
-func (s *Server) register(w http.ResponseWriter, r *http.Request) {
-	if !s.cfg.AllowRegister {
-		writeError(w, http.StatusForbidden, "register_disabled", "registration is disabled")
-		return
-	}
+type staffCreateReq struct {
+	Email     string   `json:"email"`
+	Password  string   `json:"password"`
+	Role      string   `json:"role"`
+	OutletIDs []string `json:"outlet_ids"`
+}
+
+func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	var in creds
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&in); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_json", "invalid JSON")
 		return
 	}
 	email := strings.ToLower(strings.TrimSpace(in.Email))
+	st, err := s.store.GetStaffByEmail(r.Context(), s.store.Pool, email)
+	if err != nil || st.DisabledAt != nil || !auth.VerifyPassword(in.Password, st.PasswordHash) {
+		writeError(w, http.StatusUnauthorized, ledger.CodeUnauthorized, "invalid credentials")
+		return
+	}
+	token, exp, err := auth.IssueToken(s.cfg.JWTSecret, st.Email, st.Role, st.ID, st.MerchantID, 12*time.Hour)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "internal error")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"token": token, "expires_at": exp.UTC().Format(time.RFC3339), "staff": asStaff(st),
+	})
+}
+
+func (s *Server) me(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"staff": asStaff(s.staff(r))})
+}
+
+func (s *Server) authn(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := r.Header.Get("Authorization")
+		if !strings.HasPrefix(strings.ToLower(h), "bearer ") {
+			writeError(w, http.StatusUnauthorized, ledger.CodeUnauthorized, "missing token")
+			return
+		}
+		raw := strings.TrimSpace(h[7:])
+		staffID, merchantID, _, role, err := auth.ParseToken(s.cfg.JWTSecret, raw)
+		if err != nil {
+			writeError(w, http.StatusUnauthorized, ledger.CodeUnauthorized, "invalid token")
+			return
+		}
+		st, err := s.store.GetStaffByID(r.Context(), s.store.Pool, staffID)
+		if err != nil || st.DisabledAt != nil || st.MerchantID != merchantID || st.Role != role {
+			writeError(w, http.StatusUnauthorized, ledger.CodeUnauthorized, "invalid token")
+			return
+		}
+		ctx := context.WithValue(r.Context(), staffKey, st)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+func (s *Server) requireRole(roles ...string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			st := s.staff(r)
+			for _, role := range roles {
+				if st.Role == role {
+					next.ServeHTTP(w, r)
+					return
+				}
+			}
+			writeError(w, http.StatusForbidden, ledger.CodeForbidden, "role cannot do that")
+		})
+	}
+}
+
+func (s *Server) createStaff(w http.ResponseWriter, r *http.Request) {
+	raw, ok := s.readBody(w, r)
+	if !ok {
+		return
+	}
+	var in staffCreateReq
+	if err := decodeStrict(raw, &in); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", "invalid JSON")
+		return
+	}
+	email := strings.ToLower(strings.TrimSpace(in.Email))
+	role := strings.ToLower(strings.TrimSpace(in.Role))
 	if email == "" || !strings.Contains(email, "@") {
 		writeError(w, http.StatusBadRequest, "invalid_email", "email is required")
 		return
@@ -37,6 +113,28 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	if len(in.Password) < 12 {
 		writeError(w, http.StatusBadRequest, "weak_password", "password must be at least 12 characters")
 		return
+	}
+	if !auth.ValidRole(role) {
+		writeError(w, http.StatusBadRequest, "invalid_role", "role must be admin, manager, or cashier")
+		return
+	}
+	if role != auth.RoleAdmin && len(in.OutletIDs) == 0 {
+		writeError(w, http.StatusBadRequest, "invalid_role", "manager and cashier need an outlet")
+		return
+	}
+	actor := s.staff(r)
+	var outlets []uuid.UUID
+	for _, rawID := range in.OutletIDs {
+		id, err := uuid.Parse(rawID)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_order", "outlet_id is invalid")
+			return
+		}
+		if _, err := s.store.GetOutlet(r.Context(), s.store.Pool, actor.MerchantID, id); err != nil {
+			writeLedgerError(w, err)
+			return
+		}
+		outlets = append(outlets, id)
 	}
 	hash, err := auth.HashPassword(in.Password)
 	if err != nil {
@@ -48,84 +146,86 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal", "internal error")
 		return
 	}
-	op, err := s.store.CreateOperator(r.Context(), s.store.Pool, id, email, hash)
+	var created store.Staff
+	err = s.withTx(r.Context(), func(tx pgx.Tx) error {
+		var err error
+		created, err = s.store.CreateStaff(r.Context(), tx, store.Staff{
+			ID: id, MerchantID: actor.MerchantID, Email: email, PasswordHash: hash, Role: role,
+		})
+		if err != nil {
+			return err
+		}
+		for _, oid := range outlets {
+			if err := s.store.AssignStaffOutlet(r.Context(), tx, created.ID, oid); err != nil {
+				return err
+			}
+		}
+		meta, _ := json.Marshal(map[string]any{"email": email, "role": role})
+		mid, sid := actor.MerchantID, actor.ID
+		return s.store.InsertAudit(r.Context(), tx, store.AuditEvent{
+			MerchantID: &mid, StaffID: &sid, Action: "staff.created", EntityType: "staff",
+			EntityID: created.ID, Metadata: meta,
+		})
+	})
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if asPg(err, &pgErr) && pgErr.Code == "23505" {
 			writeError(w, http.StatusConflict, "email_taken", "email already registered")
 			return
 		}
-		writeError(w, http.StatusInternalServerError, "internal", "internal error")
+		writeLedgerError(w, err)
 		return
 	}
-	token, exp, err := auth.IssueToken(s.cfg.JWTSecret, op.Email, op.ID, 8*time.Hour)
+	writeJSON(w, http.StatusCreated, asStaff(created))
+}
+
+func (s *Server) listStaff(w http.ResponseWriter, r *http.Request) {
+	list, err := s.store.ListStaff(r.Context(), s.store.Pool, s.staff(r).MerchantID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", "internal error")
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{
-		"token": token, "expires_at": exp.UTC().Format(time.RFC3339), "operator": opJSON(op),
-	})
+	out := make([]staffJSON, 0, len(list))
+	for _, st := range list {
+		out = append(out, asStaff(st))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"staff": out})
 }
 
-func (s *Server) login(w http.ResponseWriter, r *http.Request) {
-	var in creds
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_json", "invalid JSON")
+func (s *Server) disableStaff(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.parseID(w, r)
+	if !ok {
 		return
 	}
-	email := strings.ToLower(strings.TrimSpace(in.Email))
-	op, err := s.store.GetOperatorByEmail(r.Context(), s.store.Pool, email)
-	if err != nil || !auth.VerifyPassword(in.Password, op.PasswordHash) {
-		writeError(w, http.StatusUnauthorized, ledger.CodeUnauthorized, "invalid credentials")
+	actor := s.staff(r)
+	target, err := s.store.GetStaffByID(r.Context(), s.store.Pool, id)
+	if err != nil || target.MerchantID != actor.MerchantID {
+		writeError(w, http.StatusNotFound, ledger.CodeNotFound, "staff not found")
 		return
 	}
-	token, exp, err := auth.IssueToken(s.cfg.JWTSecret, op.Email, op.ID, 8*time.Hour)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", "internal error")
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"token": token, "expires_at": exp.UTC().Format(time.RFC3339), "operator": opJSON(op),
-	})
-}
-
-func (s *Server) me(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"operator": opJSON(s.operator(r))})
-}
-
-func (s *Server) authn(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		raw := bearerOrCookie(r)
-		if raw == "" {
-			writeError(w, http.StatusUnauthorized, ledger.CodeUnauthorized, "missing token")
-			return
-		}
-		id, _, err := auth.ParseToken(s.cfg.JWTSecret, raw)
+	if target.Role == auth.RoleAdmin && target.DisabledAt == nil {
+		n, err := s.store.CountActiveAdmins(r.Context(), s.store.Pool, actor.MerchantID)
 		if err != nil {
-			writeError(w, http.StatusUnauthorized, ledger.CodeUnauthorized, "invalid token")
+			writeError(w, http.StatusInternalServerError, "internal", "internal error")
 			return
 		}
-		op, err := s.store.GetOperatorByID(r.Context(), s.store.Pool, id)
-		if err != nil {
-			writeError(w, http.StatusUnauthorized, ledger.CodeUnauthorized, "invalid token")
+		if n <= 1 {
+			writeError(w, http.StatusConflict, "last_admin", "the last admin cannot be disabled")
 			return
 		}
-		ctx := context.WithValue(r.Context(), operatorKey, op)
-		next.ServeHTTP(w, r.WithContext(ctx))
-	})
-}
-
-func bearerOrCookie(r *http.Request) string {
-	h := r.Header.Get("Authorization")
-	if strings.HasPrefix(strings.ToLower(h), "bearer ") {
-		return strings.TrimSpace(h[7:])
 	}
-	c, err := r.Cookie("ledger_token")
+	updated, err := s.store.DisableStaff(r.Context(), s.store.Pool, actor.MerchantID, id, time.Now())
 	if err != nil {
-		return ""
+		writeLedgerError(w, err)
+		return
 	}
-	return c.Value
+	_ = s.withTx(r.Context(), func(tx pgx.Tx) error {
+		mid, sid := actor.MerchantID, actor.ID
+		return s.store.InsertAudit(r.Context(), tx, store.AuditEvent{
+			MerchantID: &mid, StaffID: &sid, Action: "staff.disabled", EntityType: "staff", EntityID: id,
+		})
+	})
+	writeJSON(w, http.StatusOK, asStaff(updated))
 }
 
 func asPg(err error, target **pgconn.PgError) bool {

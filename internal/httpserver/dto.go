@@ -3,19 +3,25 @@ package httpserver
 import (
 	"time"
 
-	"github.com/Muddyscode/ledger-api/internal/ledger"
-	"github.com/Muddyscode/ledger-api/internal/store"
+	"github.com/Muddyscode/till/internal/ledger"
+	"github.com/Muddyscode/till/internal/store"
 	"github.com/google/uuid"
 )
 
-type operatorJSON struct {
-	ID        uuid.UUID `json:"id"`
-	Email     string    `json:"email"`
-	CreatedAt time.Time `json:"created_at"`
+type staffJSON struct {
+	ID         uuid.UUID  `json:"id"`
+	MerchantID uuid.UUID  `json:"merchant_id"`
+	Email      string     `json:"email"`
+	Role       string     `json:"role"`
+	DisabledAt *time.Time `json:"disabled_at,omitempty"`
+	CreatedAt  time.Time  `json:"created_at"`
 }
 
-func opJSON(o store.Operator) operatorJSON {
-	return operatorJSON{ID: o.ID, Email: o.Email, CreatedAt: o.CreatedAt}
+func asStaff(st store.Staff) staffJSON {
+	return staffJSON{
+		ID: st.ID, MerchantID: st.MerchantID, Email: st.Email, Role: st.Role,
+		DisabledAt: st.DisabledAt, CreatedAt: st.CreatedAt,
+	}
 }
 
 type accountJSON struct {

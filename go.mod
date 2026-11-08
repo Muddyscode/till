@@ -1,4 +1,4 @@
-module github.com/Muddyscode/ledger-api
+module github.com/Muddyscode/till
 
 go 1.25.0
 

@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/Muddyscode/ledger-api/internal/ledger"
+	"github.com/Muddyscode/till/internal/ledger"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -71,62 +71,38 @@ func RetryDeadlock(fn func() error) error {
 	return err
 }
 
-type Operator struct {
-	ID           uuid.UUID
-	Email        string
-	PasswordHash string
-	CreatedAt    time.Time
-}
-
-func (s *Store) CreateOperator(ctx context.Context, db DBTX, id uuid.UUID, email, hash string) (Operator, error) {
-	var o Operator
-	err := db.QueryRow(ctx, `
-		INSERT INTO operators (id, email, password_hash)
-		VALUES ($1, $2, $3)
-		RETURNING id, email, password_hash, created_at
-	`, id, email, hash).Scan(&o.ID, &o.Email, &o.PasswordHash, &o.CreatedAt)
-	return o, err
-}
-
-func (s *Store) GetOperatorByEmail(ctx context.Context, db DBTX, email string) (Operator, error) {
-	var o Operator
-	err := db.QueryRow(ctx, `
-		SELECT id, email, password_hash, created_at FROM operators WHERE email = $1
-	`, email).Scan(&o.ID, &o.Email, &o.PasswordHash, &o.CreatedAt)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return Operator{}, ledger.Err(ledger.CodeNotFound, "operator not found")
+func (s *Store) CompleteIdempotency(ctx context.Context, tx pgx.Tx, merchantID uuid.UUID, key string, status int, body []byte, journalID *uuid.UUID) error {
+	tag, err := tx.Exec(ctx, `
+		UPDATE idempotency_keys
+		SET status = 'completed', http_status = $3, response_body = $4, journal_id = $5
+		WHERE merchant_id = $1 AND key = $2
+	`, merchantID, key, status, body, journalID)
+	if err != nil {
+		return err
 	}
-	return o, err
-}
-
-func (s *Store) GetOperatorByID(ctx context.Context, db DBTX, id uuid.UUID) (Operator, error) {
-	var o Operator
-	err := db.QueryRow(ctx, `
-		SELECT id, email, password_hash, created_at FROM operators WHERE id = $1
-	`, id).Scan(&o.ID, &o.Email, &o.PasswordHash, &o.CreatedAt)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return Operator{}, ledger.Err(ledger.CodeNotFound, "operator not found")
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("idempotency complete: expected 1 row")
 	}
-	return o, err
+	return nil
 }
 
 func (s *Store) CreateAccount(ctx context.Context, db DBTX, a ledger.Account) (ledger.Account, error) {
 	err := db.QueryRow(ctx, `
-		INSERT INTO accounts (id, operator_id, code, name, type, currency, allow_negative, status, balance_minor)
+		INSERT INTO accounts (id, merchant_id, code, name, type, currency, allow_negative, status, balance_minor)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-		RETURNING id, operator_id, code, name, type, currency, allow_negative, status, balance_minor, created_at
-	`, a.ID, a.OperatorID, a.Code, a.Name, a.Type, a.Currency, a.AllowNegative, a.Status, a.BalanceMinor).
-		Scan(&a.ID, &a.OperatorID, &a.Code, &a.Name, &a.Type, &a.Currency, &a.AllowNegative, &a.Status, &a.BalanceMinor, &a.CreatedAt)
+		RETURNING id, merchant_id, code, name, type, currency, allow_negative, status, balance_minor, created_at
+	`, a.ID, a.MerchantID, a.Code, a.Name, a.Type, a.Currency, a.AllowNegative, a.Status, a.BalanceMinor).
+		Scan(&a.ID, &a.MerchantID, &a.Code, &a.Name, &a.Type, &a.Currency, &a.AllowNegative, &a.Status, &a.BalanceMinor, &a.CreatedAt)
 	return a, err
 }
 
 func (s *Store) GetAccount(ctx context.Context, db DBTX, operatorID, accountID uuid.UUID) (ledger.Account, error) {
 	var a ledger.Account
 	err := db.QueryRow(ctx, `
-		SELECT id, operator_id, code, name, type, currency, allow_negative, status, balance_minor, created_at
-		FROM accounts WHERE id = $1 AND operator_id = $2
+		SELECT id, merchant_id, code, name, type, currency, allow_negative, status, balance_minor, created_at
+		FROM accounts WHERE id = $1 AND merchant_id = $2
 	`, accountID, operatorID).Scan(
-		&a.ID, &a.OperatorID, &a.Code, &a.Name, &a.Type, &a.Currency, &a.AllowNegative, &a.Status, &a.BalanceMinor, &a.CreatedAt,
+		&a.ID, &a.MerchantID, &a.Code, &a.Name, &a.Type, &a.Currency, &a.AllowNegative, &a.Status, &a.BalanceMinor, &a.CreatedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ledger.Account{}, ledger.Err(ledger.CodeNotFound, "account not found")
@@ -137,10 +113,10 @@ func (s *Store) GetAccount(ctx context.Context, db DBTX, operatorID, accountID u
 func (s *Store) GetAccountByCode(ctx context.Context, db DBTX, operatorID uuid.UUID, code string) (ledger.Account, error) {
 	var a ledger.Account
 	err := db.QueryRow(ctx, `
-		SELECT id, operator_id, code, name, type, currency, allow_negative, status, balance_minor, created_at
-		FROM accounts WHERE operator_id = $1 AND code = $2
+		SELECT id, merchant_id, code, name, type, currency, allow_negative, status, balance_minor, created_at
+		FROM accounts WHERE merchant_id = $1 AND code = $2
 	`, operatorID, code).Scan(
-		&a.ID, &a.OperatorID, &a.Code, &a.Name, &a.Type, &a.Currency, &a.AllowNegative, &a.Status, &a.BalanceMinor, &a.CreatedAt,
+		&a.ID, &a.MerchantID, &a.Code, &a.Name, &a.Type, &a.Currency, &a.AllowNegative, &a.Status, &a.BalanceMinor, &a.CreatedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ledger.Account{}, ledger.Err(ledger.CodeNotFound, "account not found")
@@ -150,8 +126,8 @@ func (s *Store) GetAccountByCode(ctx context.Context, db DBTX, operatorID uuid.U
 
 func (s *Store) ListAccounts(ctx context.Context, db DBTX, operatorID uuid.UUID, typeFilter string) ([]ledger.Account, error) {
 	q := `
-		SELECT id, operator_id, code, name, type, currency, allow_negative, status, balance_minor, created_at
-		FROM accounts WHERE operator_id = $1
+		SELECT id, merchant_id, code, name, type, currency, allow_negative, status, balance_minor, created_at
+		FROM accounts WHERE merchant_id = $1
 	`
 	args := []any{operatorID}
 	if typeFilter != "" {
@@ -167,7 +143,7 @@ func (s *Store) ListAccounts(ctx context.Context, db DBTX, operatorID uuid.UUID,
 	var out []ledger.Account
 	for rows.Next() {
 		var a ledger.Account
-		if err := rows.Scan(&a.ID, &a.OperatorID, &a.Code, &a.Name, &a.Type, &a.Currency, &a.AllowNegative, &a.Status, &a.BalanceMinor, &a.CreatedAt); err != nil {
+		if err := rows.Scan(&a.ID, &a.MerchantID, &a.Code, &a.Name, &a.Type, &a.Currency, &a.AllowNegative, &a.Status, &a.BalanceMinor, &a.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, a)
@@ -179,10 +155,10 @@ func (s *Store) CloseAccount(ctx context.Context, db DBTX, operatorID, accountID
 	var a ledger.Account
 	err := db.QueryRow(ctx, `
 		UPDATE accounts SET status = 'closed'
-		WHERE id = $1 AND operator_id = $2 AND status = 'open'
-		RETURNING id, operator_id, code, name, type, currency, allow_negative, status, balance_minor, created_at
+		WHERE id = $1 AND merchant_id = $2 AND status = 'open'
+		RETURNING id, merchant_id, code, name, type, currency, allow_negative, status, balance_minor, created_at
 	`, accountID, operatorID).Scan(
-		&a.ID, &a.OperatorID, &a.Code, &a.Name, &a.Type, &a.Currency, &a.AllowNegative, &a.Status, &a.BalanceMinor, &a.CreatedAt,
+		&a.ID, &a.MerchantID, &a.Code, &a.Name, &a.Type, &a.Currency, &a.AllowNegative, &a.Status, &a.BalanceMinor, &a.CreatedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		existing, gerr := s.GetAccount(ctx, db, operatorID, accountID)
@@ -202,9 +178,9 @@ func (s *Store) LockAccounts(ctx context.Context, tx pgx.Tx, operatorID uuid.UUI
 		return nil, ledger.Err(ledger.CodeInvalidJournal, "no accounts")
 	}
 	rows, err := tx.Query(ctx, `
-		SELECT id, operator_id, code, name, type, currency, allow_negative, status, balance_minor, created_at
+		SELECT id, merchant_id, code, name, type, currency, allow_negative, status, balance_minor, created_at
 		FROM accounts
-		WHERE operator_id = $1 AND id = ANY($2)
+		WHERE merchant_id = $1 AND id = ANY($2)
 		ORDER BY id
 		FOR UPDATE
 	`, operatorID, ids)
@@ -215,7 +191,7 @@ func (s *Store) LockAccounts(ctx context.Context, tx pgx.Tx, operatorID uuid.UUI
 	var out []ledger.Account
 	for rows.Next() {
 		var a ledger.Account
-		if err := rows.Scan(&a.ID, &a.OperatorID, &a.Code, &a.Name, &a.Type, &a.Currency, &a.AllowNegative, &a.Status, &a.BalanceMinor, &a.CreatedAt); err != nil {
+		if err := rows.Scan(&a.ID, &a.MerchantID, &a.Code, &a.Name, &a.Type, &a.Currency, &a.AllowNegative, &a.Status, &a.BalanceMinor, &a.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, a)
@@ -244,9 +220,9 @@ func uniq(ids []uuid.UUID) []uuid.UUID {
 
 func (s *Store) InsertJournal(ctx context.Context, tx pgx.Tx, j ledger.Journal) error {
 	_, err := tx.Exec(ctx, `
-		INSERT INTO journals (id, operator_id, status, description, idempotency_key, reverses_journal_id)
+		INSERT INTO journals (id, merchant_id, status, description, idempotency_key, reverses_journal_id)
 		VALUES ($1,$2,'posted',$3,NULLIF($4,''),$5)
-	`, j.ID, j.OperatorID, j.Description, j.IdempotencyKey, j.ReversesJournalID)
+	`, j.ID, j.MerchantID, j.Description, j.IdempotencyKey, j.ReversesJournalID)
 	return err
 }
 
@@ -266,9 +242,9 @@ func (s *Store) UpdateBalance(ctx context.Context, tx pgx.Tx, accountID uuid.UUI
 func (s *Store) GetJournal(ctx context.Context, db DBTX, operatorID, journalID uuid.UUID) (ledger.Journal, error) {
 	var j ledger.Journal
 	err := db.QueryRow(ctx, `
-		SELECT id, operator_id, status, description, COALESCE(idempotency_key, ''), reverses_journal_id, created_at
-		FROM journals WHERE id = $1 AND operator_id = $2
-	`, journalID, operatorID).Scan(&j.ID, &j.OperatorID, &j.Status, &j.Description, &j.IdempotencyKey, &j.ReversesJournalID, &j.CreatedAt)
+		SELECT id, merchant_id, status, description, COALESCE(idempotency_key, ''), reverses_journal_id, created_at
+		FROM journals WHERE id = $1 AND merchant_id = $2
+	`, journalID, operatorID).Scan(&j.ID, &j.MerchantID, &j.Status, &j.Description, &j.IdempotencyKey, &j.ReversesJournalID, &j.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ledger.Journal{}, ledger.Err(ledger.CodeNotFound, "journal not found")
 	}
@@ -309,9 +285,9 @@ func (s *Store) ListPostings(ctx context.Context, db DBTX, journalIDs []uuid.UUI
 
 func (s *Store) ListJournals(ctx context.Context, db DBTX, operatorID uuid.UUID, limit int, twoLeggedOnly bool) ([]ledger.Journal, error) {
 	q := `
-		SELECT j.id, j.operator_id, j.status, j.description, COALESCE(j.idempotency_key, ''), j.reverses_journal_id, j.created_at
+		SELECT j.id, j.merchant_id, j.status, j.description, COALESCE(j.idempotency_key, ''), j.reverses_journal_id, j.created_at
 		FROM journals j
-		WHERE j.operator_id = $1
+		WHERE j.merchant_id = $1
 	`
 	if twoLeggedOnly {
 		q += ` AND (SELECT COUNT(*) FROM postings p WHERE p.journal_id = j.id) = 2`
@@ -326,7 +302,7 @@ func (s *Store) ListJournals(ctx context.Context, db DBTX, operatorID uuid.UUID,
 	var ids []uuid.UUID
 	for rows.Next() {
 		var j ledger.Journal
-		if err := rows.Scan(&j.ID, &j.OperatorID, &j.Status, &j.Description, &j.IdempotencyKey, &j.ReversesJournalID, &j.CreatedAt); err != nil {
+		if err := rows.Scan(&j.ID, &j.MerchantID, &j.Status, &j.Description, &j.IdempotencyKey, &j.ReversesJournalID, &j.CreatedAt); err != nil {
 			return nil, err
 		}
 		js = append(js, j)
@@ -348,7 +324,7 @@ func (s *Store) ListJournals(ctx context.Context, db DBTX, operatorID uuid.UUID,
 func (s *Store) ReversalOf(ctx context.Context, db DBTX, operatorID, originalID uuid.UUID) (uuid.UUID, bool, error) {
 	var id uuid.UUID
 	err := db.QueryRow(ctx, `
-		SELECT id FROM journals WHERE operator_id = $1 AND reverses_journal_id = $2
+		SELECT id FROM journals WHERE merchant_id = $1 AND reverses_journal_id = $2
 	`, operatorID, originalID).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return uuid.Nil, false, nil
@@ -373,7 +349,7 @@ func (s *Store) Statement(ctx context.Context, db DBTX, operatorID, accountID uu
 		       j.description, j.created_at
 		FROM postings p
 		JOIN journals j ON j.id = p.journal_id
-		WHERE p.account_id = $1 AND j.operator_id = $2
+		WHERE p.account_id = $1 AND j.merchant_id = $2
 		ORDER BY j.created_at ASC, p.id ASC
 		LIMIT $3
 	`, accountID, operatorID, limit)
@@ -411,12 +387,12 @@ func (s *Store) Identity(ctx context.Context, db DBTX, operatorID uuid.UUID) (Id
 		SELECT
 			COALESCE(SUM(CASE WHEN type IN ('asset','expense') THEN balance_minor ELSE -balance_minor END), 0),
 			COUNT(*)
-		FROM accounts WHERE operator_id = $1
+		FROM accounts WHERE merchant_id = $1
 	`, operatorID).Scan(&idn.IdentityMinor, &idn.Accounts)
 	if err != nil {
 		return Identity{}, err
 	}
-	err = db.QueryRow(ctx, `SELECT COUNT(*) FROM journals WHERE operator_id = $1`, operatorID).Scan(&idn.Journals)
+	err = db.QueryRow(ctx, `SELECT COUNT(*) FROM journals WHERE merchant_id = $1`, operatorID).Scan(&idn.Journals)
 	if err != nil {
 		return Identity{}, err
 	}
@@ -424,7 +400,7 @@ func (s *Store) Identity(ctx context.Context, db DBTX, operatorID uuid.UUID) (Id
 		SELECT COALESCE(SUM(ABS(a.balance_minor - v.balance_minor)), 0)
 		FROM accounts a
 		JOIN account_balances_from_journal v ON v.id = a.id
-		WHERE a.operator_id = $1
+		WHERE a.merchant_id = $1
 	`, operatorID).Scan(&idn.CacheDrift)
 	return idn, err
 }
@@ -438,7 +414,7 @@ func (s *Store) CountPostings(ctx context.Context, db DBTX, operatorID uuid.UUID
 	err := db.QueryRow(ctx, `
 		SELECT COUNT(*) FROM postings p
 		JOIN journals j ON j.id = p.journal_id
-		WHERE j.operator_id = $1
+		WHERE j.merchant_id = $1
 	`, operatorID).Scan(&n)
 	return n, err
 }
@@ -453,10 +429,10 @@ type IdempotencyRecord struct {
 func (s *Store) ClaimIdempotency(ctx context.Context, tx pgx.Tx, operatorID uuid.UUID, key string, hash []byte) (IdempotencyRecord, error) {
 	var claimed uuid.UUID
 	err := tx.QueryRow(ctx, `
-		INSERT INTO idempotency_keys (operator_id, key, request_hash, status)
+		INSERT INTO idempotency_keys (merchant_id, key, request_hash, status)
 		VALUES ($1, $2, $3, 'processing')
-		ON CONFLICT (operator_id, key) DO NOTHING
-		RETURNING operator_id
+		ON CONFLICT (merchant_id, key) DO NOTHING
+		RETURNING merchant_id
 	`, operatorID, key, hash).Scan(&claimed)
 	if err == nil {
 		return IdempotencyRecord{}, nil
@@ -472,7 +448,7 @@ func (s *Store) ClaimIdempotency(ctx context.Context, tx pgx.Tx, operatorID uuid
 	err = tx.QueryRow(ctx, `
 		SELECT request_hash, status, http_status, response_body, journal_id
 		FROM idempotency_keys
-		WHERE operator_id = $1 AND key = $2
+		WHERE merchant_id = $1 AND key = $2
 		FOR UPDATE
 	`, operatorID, key).Scan(&storedHash, &status, &httpStatus, &body, &journalID)
 	if err != nil {
@@ -489,19 +465,4 @@ func (s *Store) ClaimIdempotency(ctx context.Context, tx pgx.Tx, operatorID uuid
 		st = *httpStatus
 	}
 	return IdempotencyRecord{Replay: true, HTTPStatus: st, Body: body, JournalID: journalID}, nil
-}
-
-func (s *Store) CompleteIdempotency(ctx context.Context, tx pgx.Tx, operatorID uuid.UUID, key string, status int, body []byte, journalID uuid.UUID) error {
-	tag, err := tx.Exec(ctx, `
-		UPDATE idempotency_keys
-		SET status = 'completed', http_status = $3, response_body = $4, journal_id = $5
-		WHERE operator_id = $1 AND key = $2
-	`, operatorID, key, status, body, journalID)
-	if err != nil {
-		return err
-	}
-	if tag.RowsAffected() != 1 {
-		return fmt.Errorf("idempotency complete: expected 1 row")
-	}
-	return nil
 }

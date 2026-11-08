@@ -32,6 +32,12 @@ const (
 	CodeAlreadyReversed       = "already_reversed"
 	CodeInvalidJournal        = "invalid_journal"
 	CodeDuplicateAccount      = "duplicate_account"
+	CodeInsufficientStock     = "insufficient_stock"
+	CodeInsufficientWallet    = "insufficient_wallet"
+	CodeForbidden             = "forbidden"
+	CodeOutletForbidden       = "outlet_forbidden"
+	CodeRefundViaOrder        = "refund_via_order"
+	CodeInvalidOrder          = "invalid_order"
 )
 
 func AsError(err error) *Error {

@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/Muddyscode/ledger-api/internal/ledger"
+	"github.com/Muddyscode/till/internal/ledger"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -18,7 +18,7 @@ type createAccountReq struct {
 }
 
 func (s *Server) createAccount(w http.ResponseWriter, r *http.Request) {
-	op := s.operator(r)
+	op := s.staff(r)
 	var in createAccountReq
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_json", "invalid JSON")
@@ -42,7 +42,7 @@ func (s *Server) createAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	acct, err := s.store.CreateAccount(r.Context(), s.store.Pool, ledger.Account{
 		ID:            id,
-		OperatorID:    op.ID,
+		MerchantID:    op.MerchantID,
 		Code:          in.Code,
 		Name:          in.Name,
 		Type:          t,
@@ -63,13 +63,13 @@ func (s *Server) createAccount(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listAccounts(w http.ResponseWriter, r *http.Request) {
-	op := s.operator(r)
+	op := s.staff(r)
 	filter := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("type")))
 	if filter != "" && !ledger.AccountType(filter).Valid() {
 		writeError(w, http.StatusBadRequest, "invalid_account", "invalid type filter")
 		return
 	}
-	list, err := s.store.ListAccounts(r.Context(), s.store.Pool, op.ID, filter)
+	list, err := s.store.ListAccounts(r.Context(), s.store.Pool, op.MerchantID, filter)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", "internal error")
 		return
@@ -86,7 +86,7 @@ func (s *Server) getAccount(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	acct, err := s.store.GetAccount(r.Context(), s.store.Pool, s.operator(r).ID, id)
+	acct, err := s.store.GetAccount(r.Context(), s.store.Pool, s.staff(r).MerchantID, id)
 	if err != nil {
 		writeLedgerError(w, err)
 		return
@@ -99,7 +99,7 @@ func (s *Server) closeAccount(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	acct, err := s.store.CloseAccount(r.Context(), s.store.Pool, s.operator(r).ID, id)
+	acct, err := s.store.CloseAccount(r.Context(), s.store.Pool, s.staff(r).MerchantID, id)
 	if err != nil {
 		writeLedgerError(w, err)
 		return
@@ -113,7 +113,7 @@ func (s *Server) statement(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	limit := limitParam(r, 100, 500)
-	rows, bal, err := s.store.Statement(r.Context(), s.store.Pool, s.operator(r).ID, id, limit)
+	rows, bal, err := s.store.Statement(r.Context(), s.store.Pool, s.staff(r).MerchantID, id, limit)
 	if err != nil {
 		writeLedgerError(w, err)
 		return
@@ -147,7 +147,7 @@ func (s *Server) statement(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) invariants(w http.ResponseWriter, r *http.Request) {
-	idn, err := s.store.Identity(r.Context(), s.store.Pool, s.operator(r).ID)
+	idn, err := s.store.Identity(r.Context(), s.store.Pool, s.staff(r).MerchantID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", "internal error")
 		return

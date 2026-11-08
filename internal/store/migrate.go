@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/Muddyscode/ledger-api/migrations"
+	"github.com/Muddyscode/till/migrations"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 

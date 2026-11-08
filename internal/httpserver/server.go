@@ -9,9 +9,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Muddyscode/ledger-api/internal/config"
-	"github.com/Muddyscode/ledger-api/internal/ledger"
-	"github.com/Muddyscode/ledger-api/internal/store"
+	"github.com/Muddyscode/till/internal/auth"
+	"github.com/Muddyscode/till/internal/config"
+	"github.com/Muddyscode/till/internal/ledger"
+	"github.com/Muddyscode/till/internal/store"
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -19,7 +20,7 @@ import (
 
 type contextKey int
 
-const operatorKey contextKey = 1
+const staffKey contextKey = 1
 
 type Server struct {
 	cfg    config.Config
@@ -39,25 +40,55 @@ func New(cfg config.Config, st *store.Store, log *slog.Logger) *Server {
 		})
 	})
 	r.Get("/v1/health", s.health)
-	r.Post("/v1/auth/register", s.register)
 	r.Post("/v1/auth/login", s.login)
+	r.Post("/v1/webhooks/paystack", s.paystackWebhook)
 
 	r.Group(func(r chi.Router) {
 		r.Use(s.authn)
 		r.Get("/v1/auth/me", s.me)
-		r.Get("/v1/invariants", s.invariants)
-		r.Post("/v1/accounts", s.createAccount)
-		r.Get("/v1/accounts", s.listAccounts)
-		r.Get("/v1/accounts/{id}", s.getAccount)
-		r.Get("/v1/accounts/{id}/statement", s.statement)
-		r.Post("/v1/accounts/{id}/close", s.closeAccount)
-		r.Post("/v1/transfers", s.postTransfer)
-		r.Get("/v1/transfers", s.listTransfers)
-		r.Get("/v1/transfers/{id}", s.getJournal)
-		r.Post("/v1/journals", s.postJournal)
-		r.Get("/v1/journals", s.listJournals)
-		r.Get("/v1/journals/{id}", s.getJournal)
-		r.Post("/v1/journals/{id}/reversal", s.reverseJournal)
+		r.Get("/v1/outlets", s.listOutlets)
+		r.Get("/v1/products", s.listProducts)
+		r.Post("/v1/customers", s.createCustomer)
+		r.Get("/v1/customers", s.listCustomers)
+		r.Get("/v1/customers/{id}", s.getCustomer)
+		r.Post("/v1/customers/{id}/topups", s.topUpCustomer)
+		r.Get("/v1/orders", s.listOrders)
+		r.Get("/v1/orders/{id}", s.getOrder)
+		r.Post("/v1/orders", s.createOrder)
+		r.Get("/v1/reports/stock-on-hand", s.stockOnHand)
+		r.Get("/v1/reports/low-stock", s.lowStock)
+
+		r.Group(func(r chi.Router) {
+			r.Use(s.requireRole(auth.RoleAdmin, auth.RoleManager))
+			r.Post("/v1/products", s.createProduct)
+			r.Patch("/v1/products/{id}", s.patchProduct)
+			r.Post("/v1/stock/receipts", s.receiveStock)
+			r.Post("/v1/stock/adjustments", s.adjustStock)
+			r.Post("/v1/orders/{id}/refund", s.refundOrder)
+			r.Get("/v1/reports/daily-sales", s.dailySales)
+			r.Get("/v1/audit", s.listAudit)
+		})
+
+		r.Group(func(r chi.Router) {
+			r.Use(s.requireRole(auth.RoleAdmin))
+			r.Post("/v1/staff", s.createStaff)
+			r.Get("/v1/staff", s.listStaff)
+			r.Post("/v1/staff/{id}/disable", s.disableStaff)
+			r.Post("/v1/outlets", s.createOutlet)
+			r.Get("/v1/invariants", s.invariants)
+			r.Post("/v1/accounts", s.createAccount)
+			r.Get("/v1/accounts", s.listAccounts)
+			r.Get("/v1/accounts/{id}", s.getAccount)
+			r.Get("/v1/accounts/{id}/statement", s.statement)
+			r.Post("/v1/accounts/{id}/close", s.closeAccount)
+			r.Post("/v1/transfers", s.postTransfer)
+			r.Get("/v1/transfers", s.listTransfers)
+			r.Get("/v1/transfers/{id}", s.getJournal)
+			r.Post("/v1/journals", s.postJournal)
+			r.Get("/v1/journals", s.listJournals)
+			r.Get("/v1/journals/{id}", s.getJournal)
+			r.Post("/v1/journals/{id}/reversal", s.reverseJournal)
+		})
 	})
 
 	s.router = r
@@ -87,16 +118,16 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
 }
 
-func WithOperator(ctx context.Context, op store.Operator) context.Context {
-	return context.WithValue(ctx, operatorKey, op)
+func WithStaff(ctx context.Context, st store.Staff) context.Context {
+	return context.WithValue(ctx, staffKey, st)
 }
 
-func OperatorFrom(r *http.Request) store.Operator {
-	return r.Context().Value(operatorKey).(store.Operator)
+func StaffFrom(r *http.Request) store.Staff {
+	return r.Context().Value(staffKey).(store.Staff)
 }
 
-func (s *Server) operator(r *http.Request) store.Operator {
-	return OperatorFrom(r)
+func (s *Server) staff(r *http.Request) store.Staff {
+	return StaffFrom(r)
 }
 
 func (s *Server) parseID(w http.ResponseWriter, r *http.Request) (uuid.UUID, bool) {
