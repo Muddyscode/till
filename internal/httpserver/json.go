@@ -38,6 +38,9 @@ func writeLedgerError(w http.ResponseWriter, err error) {
 		writeError(w, statusFor(le.Code), le.Code, le.Message)
 		return
 	}
+	if er, ok := w.(errorSetter); ok {
+		er.SetError(err)
+	}
 	writeError(w, http.StatusInternalServerError, "internal", "internal error")
 }
 

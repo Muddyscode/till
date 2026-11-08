@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -49,9 +50,16 @@ func main() {
 		}
 	}
 
-	go checkout.RunSweeper(ctx, st, 30*time.Second, log)
-
 	api := httpserver.New(cfg, st, log)
+	const sweepEvery = 30 * time.Second
+	api.ExpectSweeper(sweepEvery)
+	var sweeper sync.WaitGroup
+	sweeper.Add(1)
+	go func() {
+		defer sweeper.Done()
+		checkout.RunSweeper(ctx, st, sweepEvery, log, api.SweeperBeat)
+	}()
+
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           httpserver.Handler(api),
@@ -72,12 +80,25 @@ func main() {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
-	cancel()
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	log.Info("shutting down")
+	api.SetDraining() // /readyz fails from here
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer shutdownCancel()
-	_ = srv.Shutdown(shutdownCtx)
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Error("http shutdown", "err", err)
+	}
+	cancel()
+	done := make(chan struct{})
+	go func() { sweeper.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-shutdownCtx.Done():
+		log.Error("sweeper did not stop in time")
+	}
 }
 
+// runSweeper releases expired transfer holds every `every` and calls beat after each
+// successful pass, which is what /readyz watches.
 func loadDotEnv(path string) {
 	b, err := os.ReadFile(path)
 	if err != nil {

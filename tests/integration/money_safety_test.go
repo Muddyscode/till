@@ -139,8 +139,8 @@ func TestIdempotencyKeyScopedToRouteAndReplayHeader(t *testing.T) {
 	}
 
 	// Wallet top-ups to two customers with one key: the second must not look like a replay.
-	c1 := sh.admin.customer("One", "0801"+uuid.NewString()[:7])
-	c2 := sh.admin.customer("Two", "0802"+uuid.NewString()[:7])
+	c1 := sh.admin.customer("One", uniquePhone())
+	c2 := sh.admin.customer("Two", uniquePhone())
 	k2 := "topup-" + uuid.NewString()
 	body := map[string]any{"outlet_id": sh.ikeja, "amount_minor": 50_000}
 	res, out = sh.admin.postKeyed("/v1/customers/"+c1+"/topups", k2, body)
@@ -488,7 +488,7 @@ func TestControlAccountsRefuseFreeFormPostings(t *testing.T) {
 	sh := openShop(t, 0)
 	sh.admin.createProduct("SERUM", "Serum", 100_000, 1)
 	sh.admin.receive(sh.ikeja, "SERUM", 2)
-	cust := sh.admin.customer("Ada", "0803"+uuid.NewString()[:7])
+	cust := sh.admin.customer("Ada", uniquePhone())
 	if r, o := sh.admin.postKeyed("/v1/customers/"+cust+"/topups", "tu-"+uuid.NewString(), map[string]any{"outlet_id": sh.ikeja, "amount_minor": 20_000}); r.StatusCode != 201 {
 		t.Fatalf("topup %d %v", r.StatusCode, o)
 	}
@@ -540,7 +540,7 @@ func TestInvariantsReportEachCheck(t *testing.T) {
 	sh := openShop(t, 0)
 	sh.admin.createProduct("SERUM", "Serum", 100_000, 1)
 	sh.admin.receive(sh.ikeja, "SERUM", 2)
-	cust := sh.admin.customer("Ada", "0804"+uuid.NewString()[:7])
+	cust := sh.admin.customer("Ada", uniquePhone())
 	sh.admin.postKeyed("/v1/customers/"+cust+"/topups", "tu-"+uuid.NewString(), map[string]any{"outlet_id": sh.ikeja, "amount_minor": 20_000})
 	inv := sh.admin.identity()
 	checks, _ := inv["checks"].([]any)

@@ -23,50 +23,73 @@ func ValidRole(role string) bool {
 }
 
 type Claims struct {
-	Email      string `json:"email"`
-	MerchantID string `json:"merchant_id"`
-	Role       string `json:"role"`
+	Email        string `json:"email"`
+	MerchantID   string `json:"merchant_id"`
+	Role         string `json:"role"`
+	TokenVersion int    `json:"tv"`
 	jwt.RegisteredClaims
 }
 
-func IssueToken(secret, email, role string, staffID, merchantID uuid.UUID, ttl time.Duration) (string, time.Time, error) {
-	exp := time.Now().Add(ttl)
+// Identity is what a verified token says about the caller.
+type Identity struct {
+	StaffID      uuid.UUID
+	MerchantID   uuid.UUID
+	Email        string
+	Role         string
+	TokenVersion int
+	JTI          string
+}
+
+// IssueToken signs a token that carries the staff row's token_version.
+// Bumping token_version on the staff row revokes every token issued before.
+func IssueToken(secret, email, role string, staffID, merchantID uuid.UUID, tokenVersion int, ttl time.Duration) (string, time.Time, error) {
+	now := time.Now()
+	exp := now.Add(ttl)
+	jti, err := uuid.NewV7()
+	if err != nil {
+		return "", time.Time{}, err
+	}
 	t := jwt.NewWithClaims(jwt.SigningMethodHS256, Claims{
-		Email:      email,
-		MerchantID: merchantID.String(),
-		Role:       role,
+		Email:        email,
+		MerchantID:   merchantID.String(),
+		Role:         role,
+		TokenVersion: tokenVersion,
 		RegisteredClaims: jwt.RegisteredClaims{
+			ID:        jti.String(),
 			Subject:   staffID.String(),
 			Issuer:    "till",
 			ExpiresAt: jwt.NewNumericDate(exp),
-			IssuedAt:  jwt.NewNumericDate(time.Now()),
+			IssuedAt:  jwt.NewNumericDate(now),
 		},
 	})
 	s, err := t.SignedString([]byte(secret))
 	return s, exp, err
 }
 
-func ParseToken(secret, token string) (staffID, merchantID uuid.UUID, email, role string, err error) {
+func ParseToken(secret, token string) (Identity, error) {
 	parsed, err := jwt.ParseWithClaims(token, &Claims{}, func(t *jwt.Token) (any, error) {
 		if t.Method != jwt.SigningMethodHS256 {
 			return nil, fmt.Errorf("unexpected signing method")
 		}
 		return []byte(secret), nil
-	})
+	}, jwt.WithIssuer("till"), jwt.WithExpirationRequired())
 	if err != nil {
-		return uuid.Nil, uuid.Nil, "", "", err
+		return Identity{}, err
 	}
 	claims, ok := parsed.Claims.(*Claims)
 	if !ok || !parsed.Valid {
-		return uuid.Nil, uuid.Nil, "", "", fmt.Errorf("invalid token")
+		return Identity{}, fmt.Errorf("invalid token")
 	}
-	staffID, err = uuid.Parse(claims.Subject)
+	staffID, err := uuid.Parse(claims.Subject)
 	if err != nil {
-		return uuid.Nil, uuid.Nil, "", "", err
+		return Identity{}, err
 	}
-	merchantID, err = uuid.Parse(claims.MerchantID)
+	merchantID, err := uuid.Parse(claims.MerchantID)
 	if err != nil {
-		return uuid.Nil, uuid.Nil, "", "", err
+		return Identity{}, err
 	}
-	return staffID, merchantID, claims.Email, claims.Role, nil
+	return Identity{
+		StaffID: staffID, MerchantID: merchantID, Email: claims.Email, Role: claims.Role,
+		TokenVersion: claims.TokenVersion, JTI: claims.ID,
+	}, nil
 }

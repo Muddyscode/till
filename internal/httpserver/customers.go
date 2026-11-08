@@ -3,7 +3,10 @@ package httpserver
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
+	"unicode/utf8"
 
+	"github.com/Muddyscode/till/internal/auth"
 	"github.com/Muddyscode/till/internal/checkout"
 	"github.com/Muddyscode/till/internal/money"
 	"github.com/Muddyscode/till/internal/store"
@@ -22,9 +25,14 @@ type topUpReq struct {
 	AmountMinor json.RawMessage `json:"amount_minor"`
 }
 
-func customerBody(c store.Customer) map[string]any {
+// customerView hides most of the phone number unless the caller may see it (manager, admin).
+func customerView(c store.Customer, fullPhone bool) map[string]any {
+	phone := c.Phone
+	if !fullPhone {
+		phone = store.MaskPhone(phone)
+	}
 	return map[string]any{
-		"id": c.ID, "name": c.Name, "phone": c.Phone,
+		"id": c.ID, "name": c.Name, "phone": phone,
 		"balance_minor": c.BalanceMinor, "created_at": c.CreatedAt,
 	}
 }
@@ -44,9 +52,14 @@ func (s *Server) createCustomer(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal", "internal error")
 		return
 	}
+	phone, err := store.NormalizePhone(in.Phone)
+	if err != nil {
+		writeLedgerError(w, err)
+		return
+	}
 	actor := s.staff(r)
 	c, err := s.store.CreateCustomer(r.Context(), s.store.Pool, store.Customer{
-		ID: id, MerchantID: actor.MerchantID, Name: in.Name, Phone: in.Phone,
+		ID: id, MerchantID: actor.MerchantID, Name: in.Name, Phone: phone,
 	})
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -57,20 +70,31 @@ func (s *Server) createCustomer(w http.ResponseWriter, r *http.Request) {
 		writeLedgerError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, customerBody(c))
+	writeJSON(w, http.StatusCreated, customerView(c, canSeePhone(actor)))
 }
 
 func (s *Server) listCustomers(w http.ResponseWriter, r *http.Request) {
-	list, err := s.store.ListCustomers(r.Context(), s.store.Pool, s.staff(r).MerchantID)
+	st := s.staff(r)
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	full := canSeePhone(st)
+	if !full && utf8.RuneCountInString(q) < 3 {
+		writeError(w, http.StatusBadRequest, "search_required", "cashiers must search customers with q (at least 3 characters)")
+		return
+	}
+	list, err := s.store.SearchCustomers(r.Context(), s.store.Pool, st.MerchantID, q, limitParam(r, 50, 200))
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", "internal error")
+		s.internalError(w, r, err)
 		return
 	}
 	out := make([]map[string]any, 0, len(list))
 	for _, c := range list {
-		out = append(out, customerBody(c))
+		out = append(out, customerView(c, full))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"customers": out})
+}
+
+func canSeePhone(st store.Staff) bool {
+	return st.Role == auth.RoleAdmin || st.Role == auth.RoleManager
 }
 
 func (s *Server) getCustomer(w http.ResponseWriter, r *http.Request) {
@@ -83,7 +107,7 @@ func (s *Server) getCustomer(w http.ResponseWriter, r *http.Request) {
 		writeLedgerError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, customerBody(c))
+	writeJSON(w, http.StatusOK, customerView(c, canSeePhone(s.staff(r))))
 }
 
 func (s *Server) topUpCustomer(w http.ResponseWriter, r *http.Request) {
@@ -131,7 +155,7 @@ func (s *Server) topUpCustomer(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return 0, nil, nil, err
 		}
-		body := customerBody(c)
+		body := customerView(c, false)
 		body["journal_id"] = j.ID
 		rawBody, err := json.Marshal(body)
 		if err != nil {

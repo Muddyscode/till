@@ -136,7 +136,10 @@ func SweepExpired(ctx context.Context, st *store.Store, log *slog.Logger, now ti
 	return released
 }
 
-func RunSweeper(ctx context.Context, st *store.Store, every time.Duration, log *slog.Logger) {
+// RunSweeper releases expired holds every tick and purges old idempotency
+// keys hourly. beat, when non-nil, is called after every completed tick so
+// readiness can report a stalled sweeper.
+func RunSweeper(ctx context.Context, st *store.Store, every time.Duration, log *slog.Logger, beat func()) {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -162,6 +165,9 @@ func RunSweeper(ctx context.Context, st *store.Store, every time.Duration, log *
 						log.Info("sweeper: purged idempotency keys", "count", purged)
 					}
 				}
+			}
+			if beat != nil {
+				beat()
 			}
 		}
 	}

@@ -69,12 +69,30 @@ The order is `paid`. The response is `201`. Audit action: `order.paid`.
 | Role | Can do |
 |---|---|
 | Cashier | Log in, see assigned outlets, sell, read stock, create a customer, take a cash top-up |
-| Manager | Cashier, plus products, receipts, adjustments, refunds, daily sales, audit for their outlet |
-| Admin | Manager, plus staff, outlets, the chart of accounts, and free-form journals |
+| Manager | Cashier, plus non-price product edits, receipts, adjustments, refunds, daily sales, audit for their outlet |
+| Admin | Manager, plus creating products and price or cost changes, staff, API keys, outlets, the chart of accounts, and free-form journals |
 
 An outlet id from another merchant is `404`. The same merchant, but a staff member who is not assigned to that outlet, is `403 outlet_forbidden`. Admins are not assigned outlet-by-outlet. They see the whole merchant. The last active admin cannot be disabled (`409 last_admin`).
 
 `GET /v1/reports/daily-sales` always requires `outlet_id`, including for an admin. The day is an Africa/Lagos calendar date. Omit `date` and the report uses today in Lagos. Admin may omit `outlet_id` on `GET /v1/orders` and `GET /v1/audit`. A manager or cashier must pass one.
+
+## Security and operations
+
+**Login.** Per-IP and per-email token buckets (`429 rate_limited` with `Retry-After`; they live in process memory, so with several instances each enforces its own limit). Ten failed logins in 15 minutes lock the account for 15 minutes (`429 account_locked`), stored in Postgres so it holds across instances. Unknown emails are verified against a dummy argon2 hash so they look like a wrong password, argon2 runs behind a 4-way semaphore, and the login body is capped at 4 KiB.
+
+**Tokens.** Access tokens carry `jti` and the staff row's `token_version`; `TILL_TOKEN_TTL` sets the lifetime (default `8h`). `POST /v1/auth/logout` and `POST /v1/auth/password` (current password required, 12 to 128 characters) bump the version and kill every older token. An admin can `POST /v1/staff/{id}/password-reset`.
+
+**API keys.** Admin `POST /v1/api-keys` with `name`, `role` (`cashier` or `manager`) and `outlet_ids` returns `till_live_<prefix>_<secret>` once. Send it as `Authorization: Bearer till_live_...`. Only a SHA-256 digest is stored. `GET /v1/api-keys` lists, `DELETE /v1/api-keys/{id}` revokes at once. Each key is backed by a non-login staff row, so outlet scope, roles, orders and audit work unchanged (the audit `staff_id` is the key's `staff_id`).
+
+**Authorization.** Only admins create products or change `price_minor` / `avg_cost_minor` (managers get `403`). Cashiers list customers only with `q` (3+ characters) and see phones masked as `0803****567`; managers and admins see full numbers. Phones are stored as E.164 (`+2348031234567`).
+
+**Pagination.** `GET /v1/orders`, `/v1/journals`, `/v1/transfers` and `/v1/audit` return `next_cursor` (null on the last page); pass it back as `cursor`. Orders also filter by `status`, `reference`, `customer_id`, `from`, `to`.
+
+**Production guard.** `TILL_ENV=production` refuses the `.env.example` secrets, short secrets (JWT under 48, Paystack under 24 characters), `TILL_SEED=true`, and `TILL_CORS_ORIGINS=*`.
+
+**HTTP.** `X-Request-ID` in and out, JSON access log per request (route pattern, status, duration, merchant, staff, api key), JSON `404`/`405`/`413`, `Cache-Control: no-store` on `/v1`, CORS only for origins in `TILL_CORS_ORIGINS`.
+
+**Ops.** `/livez`, `/readyz` (database, sweeper heartbeat, draining), `/metrics` (Prometheus text), graceful shutdown waits for the sweeper. `Dockerfile` builds a non-root image; CI builds it. Backups, restore drill, rotation and incident steps: [docs/RUNBOOK.md](docs/RUNBOOK.md).
 
 ## Money, VAT, and stock
 
@@ -258,7 +276,7 @@ internal/checkout         cash sale, wallet, reserve, confirm, refund, receipts,
 internal/ledger           double-entry post, reversals, immutability
 internal/store            pgx and SQL
 internal/seed             Adaeze Studio
-migrations                0001 ledger, 0002 POS, 0003 wallet and cost
+migrations                0001 ledger, 0002 POS, 0003 wallet and cost, 0005 security
 ```
 
 One stateless API process. One Postgres. Journals and postings are append-only: a trigger rejects updates and deletes. Reversals are new journals. Cached `balance_minor` moves in the same transaction as the postings. The journal is the source of truth.
@@ -279,4 +297,4 @@ That is not a wallet you can withdraw to a bank, send to another person, or spen
 
 ## Layout
 
-Environment variables use the prefix `TILL_`. See `.env.example`. The binary is `tilld`. JWT issuer is `till`. The subject is the staff id. Claims carry `merchant_id` and `role`. Passwords are argon2id, minimum 12 characters. Tokens last 12 hours, and every request reloads the staff row so a disabled account or a changed role stops working immediately.
+Environment variables use the prefix `TILL_`. See `.env.example`. The binary is `tilld`. JWT issuer is `till`. The subject is the staff id. Claims carry `merchant_id`, `role`, `jti` and `tv` (token version). Passwords are argon2id, minimum 12 characters. Tokens last `TILL_TOKEN_TTL` (default 8 hours), and every request reloads the staff row so a disabled account or a changed role stops working immediately.

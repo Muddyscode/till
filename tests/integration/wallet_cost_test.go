@@ -129,7 +129,7 @@ func TestWalletTopUpPaysForSaleAndRefundRestores(t *testing.T) {
 	sh := openShop(t, 0)
 	sh.admin.createProduct("SOAP", "Soap", 450_000, 1)
 	sh.admin.receive(sh.ikeja, "SOAP", 5)
-	phone := "0803" + uuid.NewString()[:8]
+	phone := uniquePhone()
 	id := sh.admin.customer("Chidi", phone)
 	dup := sh.admin.do(http.MethodPost, "/v1/customers", map[string]any{"name": "Other", "phone": phone}, nil)
 	var dupBody map[string]any
@@ -224,7 +224,7 @@ func TestWalletTopUpPaysForSaleAndRefundRestores(t *testing.T) {
 	email := "cashier-" + uuid.NewString()[:8] + "@test.local"
 	sh.admin.addStaff(email, "cashier", sh.ikeja)
 	cashier := loginEmail(t, email)
-	cid := cashier.customer("Cashier Customer", "0803999"+uuid.NewString()[:6])
+	cid := cashier.customer("Cashier Customer", uniquePhone())
 	ch := http.Header{}
 	ch.Set("Idempotency-Key", "csh-"+uuid.NewString())
 	ctop := cashier.do(http.MethodPost, "/v1/customers/"+cid+"/topups", map[string]any{

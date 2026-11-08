@@ -1,7 +1,6 @@
 package httpserver
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -28,55 +27,8 @@ type staffCreateReq struct {
 	OutletIDs []string `json:"outlet_ids"`
 }
 
-func (s *Server) login(w http.ResponseWriter, r *http.Request) {
-	var in creds
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&in); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_json", "invalid JSON")
-		return
-	}
-	email := strings.ToLower(strings.TrimSpace(in.Email))
-	st, err := s.store.GetStaffByEmail(r.Context(), s.store.Pool, email)
-	if err != nil || st.DisabledAt != nil || !auth.VerifyPassword(in.Password, st.PasswordHash) {
-		writeError(w, http.StatusUnauthorized, ledger.CodeUnauthorized, "invalid credentials")
-		return
-	}
-	token, exp, err := auth.IssueToken(s.cfg.JWTSecret, st.Email, st.Role, st.ID, st.MerchantID, 12*time.Hour)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", "internal error")
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"token": token, "expires_at": exp.UTC().Format(time.RFC3339), "staff": asStaff(st),
-	})
-}
-
 func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"staff": asStaff(s.staff(r))})
-}
-
-func (s *Server) authn(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		h := r.Header.Get("Authorization")
-		if !strings.HasPrefix(strings.ToLower(h), "bearer ") {
-			writeError(w, http.StatusUnauthorized, ledger.CodeUnauthorized, "missing token")
-			return
-		}
-		raw := strings.TrimSpace(h[7:])
-		staffID, merchantID, _, role, err := auth.ParseToken(s.cfg.JWTSecret, raw)
-		if err != nil {
-			writeError(w, http.StatusUnauthorized, ledger.CodeUnauthorized, "invalid token")
-			return
-		}
-		st, err := s.store.GetStaffByID(r.Context(), s.store.Pool, staffID)
-		if err != nil || st.DisabledAt != nil || st.MerchantID != merchantID || st.Role != role {
-			writeError(w, http.StatusUnauthorized, ledger.CodeUnauthorized, "invalid token")
-			return
-		}
-		ctx := context.WithValue(r.Context(), staffKey, st)
-		next.ServeHTTP(w, r.WithContext(ctx))
-	})
 }
 
 func (s *Server) requireRole(roles ...string) func(http.Handler) http.Handler {
@@ -110,6 +62,10 @@ func (s *Server) createStaff(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_email", "email is required")
 		return
 	}
+	if len(in.Password) > maxPasswordLn {
+		writeError(w, http.StatusBadRequest, "weak_password", "password must be at most 128 characters")
+		return
+	}
 	if len(in.Password) < 12 {
 		writeError(w, http.StatusBadRequest, "weak_password", "password must be at least 12 characters")
 		return
@@ -136,7 +92,7 @@ func (s *Server) createStaff(w http.ResponseWriter, r *http.Request) {
 		}
 		outlets = append(outlets, id)
 	}
-	hash, err := auth.HashPassword(in.Password)
+	hash, err := s.argon.Hash(r.Context(), in.Password)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", "internal error")
 		return
@@ -180,7 +136,7 @@ func (s *Server) createStaff(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listStaff(w http.ResponseWriter, r *http.Request) {
-	list, err := s.store.ListStaff(r.Context(), s.store.Pool, s.staff(r).MerchantID)
+	list, err := s.store.ListLoginStaff(r.Context(), s.store.Pool, s.staff(r).MerchantID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", "internal error")
 		return
