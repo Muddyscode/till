@@ -1,7 +1,6 @@
 package httpserver
 
 import (
-	"encoding/json"
 	"net/http"
 	"strings"
 
@@ -20,7 +19,11 @@ type createAccountReq struct {
 func (s *Server) createAccount(w http.ResponseWriter, r *http.Request) {
 	op := s.staff(r)
 	var in createAccountReq
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+	raw, ok := s.readBody(w, r)
+	if !ok {
+		return
+	}
+	if err := decodeStrict(raw, &in); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_json", "invalid JSON")
 		return
 	}

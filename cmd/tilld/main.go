@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/Muddyscode/till/internal/httpserver"
 	"github.com/Muddyscode/till/internal/seed"
 	"github.com/Muddyscode/till/internal/store"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -49,9 +51,16 @@ func main() {
 		}
 	}
 
-	go checkout.RunSweeper(ctx, st, 30*time.Second)
-
 	api := httpserver.New(cfg, st, log)
+	const sweepEvery = 30 * time.Second
+	api.ExpectSweeper(sweepEvery)
+	var sweeper sync.WaitGroup
+	sweeper.Add(1)
+	go func() {
+		defer sweeper.Done()
+		runSweeper(ctx, st, sweepEvery, api.SweeperBeat, log)
+	}()
+
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           httpserver.Handler(api),
@@ -72,10 +81,46 @@ func main() {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
-	cancel()
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	log.Info("shutting down")
+	api.SetDraining() // /readyz fails from here
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer shutdownCancel()
-	_ = srv.Shutdown(shutdownCtx)
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Error("http shutdown", "err", err)
+	}
+	cancel()
+	done := make(chan struct{})
+	go func() { sweeper.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-shutdownCtx.Done():
+		log.Error("sweeper did not stop in time")
+	}
+}
+
+// runSweeper releases expired transfer holds every `every` and calls beat after each
+// successful pass, which is what /readyz watches.
+func runSweeper(ctx context.Context, st *store.Store, every time.Duration, beat func(), log *slog.Logger) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			err := st.WithTx(ctx, func(tx pgx.Tx) error {
+				_, err := checkout.ReleaseExpired(ctx, tx, st, time.Now())
+				return err
+			})
+			if err != nil {
+				if ctx.Err() == nil {
+					log.Error("sweeper", "err", err)
+				}
+				continue
+			}
+			beat()
+		}
+	}
 }
 
 func loadDotEnv(path string) {

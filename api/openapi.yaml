@@ -26,6 +26,8 @@ tags:
   - name: Reports
   - name: Audit
   - name: Staff
+  - name: ApiKeys
+  - name: Ops
   - name: Ledger
 
 paths:
@@ -65,7 +67,7 @@ paths:
                 password: { type: string }
       responses:
         "200":
-          description: Bearer token, valid for 12 hours
+          description: Bearer token. Lifetime is TILL_TOKEN_TTL (default 8h). It carries jti and a per-staff token version, so logout or a password change revokes it.
           content:
             application/json:
               schema:
@@ -77,6 +79,11 @@ paths:
                   staff: { $ref: "#/components/schemas/Staff" }
         "401":
           $ref: "#/components/responses/Error"
+        "429":
+          description: rate_limited (per IP or per email) or account_locked (10 failures in 15 minutes). Retry-After is set.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /v1/auth/me:
     get:
@@ -312,9 +319,13 @@ paths:
   /v1/customers:
     get:
       tags: [Customers]
-      summary: List customers and their store-credit balances
+      summary: Search customers and their store-credit balances
+      description: Cashiers must pass q (at least 3 characters, name or phone) and see the phone masked as 0803****567. Managers and admins see full numbers and may omit q.
       operationId: listCustomers
       security: [{ bearerAuth: [] }]
+      parameters:
+        - { in: query, name: q, description: "Name substring or phone digits", schema: { type: string, minLength: 3 } }
+        - $ref: "#/components/parameters/limit"
       responses:
         "200":
           description: Customers, ordered by name
@@ -342,7 +353,7 @@ paths:
               additionalProperties: false
               properties:
                 name: { type: string, maxLength: 80 }
-                phone: { type: string, maxLength: 32, example: "08030001111" }
+                phone: { type: string, maxLength: 32, example: "08030001111", description: "Normalised to E.164 (+2348030001111). Invalid numbers are 400 invalid_phone." }
       responses:
         "201":
           description: Customer created with a zero balance
@@ -423,6 +434,12 @@ paths:
       parameters:
         - $ref: "#/components/parameters/outletId"
         - $ref: "#/components/parameters/limit"
+        - $ref: "#/components/parameters/cursor"
+        - { in: query, name: status, schema: { type: string, enum: [pending_payment, paid, expired, refunded] } }
+        - { in: query, name: reference, schema: { type: string } }
+        - { in: query, name: customer_id, schema: { type: string, format: uuid } }
+        - { in: query, name: from, description: "RFC 3339 or YYYY-MM-DD (Lagos time). created_at >= from.", schema: { type: string } }
+        - { in: query, name: to, description: "RFC 3339 (exclusive) or YYYY-MM-DD (that whole day, Lagos time).", schema: { type: string } }
       responses:
         "200":
           description: Orders, newest first
@@ -434,6 +451,7 @@ paths:
                   orders:
                     type: array
                     items: { $ref: "#/components/schemas/Order" }
+                  next_cursor: { $ref: "#/components/schemas/NextCursor" }
     post:
       tags: [Orders]
       summary: Sell
@@ -665,6 +683,7 @@ paths:
       parameters:
         - $ref: "#/components/parameters/outletId"
         - $ref: "#/components/parameters/limit"
+        - $ref: "#/components/parameters/cursor"
       responses:
         "200":
           description: Audit events, append-only
@@ -676,6 +695,7 @@ paths:
                   events:
                     type: array
                     items: { $ref: "#/components/schemas/AuditEvent" }
+                  next_cursor: { $ref: "#/components/schemas/NextCursor" }
 
   /v1/staff:
     get:
@@ -892,6 +912,9 @@ paths:
       summary: List transfers
       operationId: listTransfers
       security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/limit"
+        - $ref: "#/components/parameters/cursor"
       responses:
         "200":
           description: Journals that are transfers
@@ -903,6 +926,7 @@ paths:
                   transfers:
                     type: array
                     items: { $ref: "#/components/schemas/Journal" }
+                  next_cursor: { $ref: "#/components/schemas/NextCursor" }
 
   /v1/transfers/{id}:
     get:
@@ -953,6 +977,9 @@ paths:
       summary: List journals
       operationId: listJournals
       security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/limit"
+        - $ref: "#/components/parameters/cursor"
       responses:
         "200":
           description: Journals
@@ -964,6 +991,7 @@ paths:
                   journals:
                     type: array
                     items: { $ref: "#/components/schemas/Journal" }
+                  next_cursor: { $ref: "#/components/schemas/NextCursor" }
 
   /v1/journals/{id}:
     get:
@@ -1002,12 +1030,179 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
 
+  /livez:
+    get:
+      tags: [Ops]
+      summary: Liveness
+      description: 200 while the process is serving. Does not touch the database.
+      operationId: livez
+      responses:
+        "200": { description: Process is up }
+
+  /readyz:
+    get:
+      tags: [Ops]
+      summary: Readiness
+      description: 200 when the database answers, the sweeper has completed a pass within 3x its interval, and the process is not shutting down. Otherwise 503 with the failing check.
+      operationId: readyz
+      responses:
+        "200": { description: Ready }
+        "503": { description: Not ready }
+
+  /metrics:
+    get:
+      tags: [Ops]
+      summary: Prometheus metrics
+      description: "Text format. http_requests_total{route,status}, http_request_duration_seconds histogram, login_failures_total, rate_limited_total{scope}. Not authenticated: restrict it at the proxy."
+      operationId: metrics
+      responses:
+        "200":
+          description: Prometheus exposition format
+          content:
+            text/plain: { schema: { type: string } }
+
+  /v1/auth/logout:
+    post:
+      tags: [Auth]
+      summary: Log out everywhere
+      description: Bumps the staff member's token version, so every token issued so far stops working. Not available to API keys.
+      operationId: logout
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200": { description: Logged out }
+        "401":
+          $ref: "#/components/responses/Error"
+
+  /v1/auth/password:
+    post:
+      tags: [Auth]
+      summary: Change own password
+      description: Requires the current password (wrong guesses count toward lockout). New password is 12 to 128 characters and differs from the current one. Revokes every older token and returns a fresh one.
+      operationId: changePassword
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [current_password, new_password]
+              additionalProperties: false
+              properties:
+                current_password: { type: string }
+                new_password: { type: string, minLength: 12, maxLength: 128 }
+      responses:
+        "200":
+          description: New token
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string }
+                  expires_at: { type: string, format: date-time }
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+
+  /v1/staff/{id}/password-reset:
+    post:
+      tags: [Staff]
+      summary: Reset a staff password
+      description: Admin only. Sets a new password, clears any lockout and revokes the person's tokens.
+      operationId: resetStaffPassword
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/id"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [new_password]
+              additionalProperties: false
+              properties:
+                new_password: { type: string, minLength: 12, maxLength: 128 }
+      responses:
+        "200": { description: Password reset }
+        "404":
+          $ref: "#/components/responses/Error"
+
+  /v1/api-keys:
+    get:
+      tags: [ApiKeys]
+      summary: List API keys
+      description: Admin only. Secrets are never listed. last_used_at is updated at most once a minute.
+      operationId: listApiKeys
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: Keys, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  api_keys:
+                    type: array
+                    items: { $ref: "#/components/schemas/ApiKey" }
+    post:
+      tags: [ApiKeys]
+      summary: Create an API key
+      description: |
+        Admin only. The response contains `secret` (`till_live_<prefix>_<secret>`) exactly once; Till stores only a SHA-256 digest.
+        Send it as `Authorization: Bearer till_live_...`. The key acts as a cashier or manager limited to the listed outlets. Each key is backed by a non-login staff row (`staff_id`), which is the actor recorded in orders and audit.
+      operationId: createApiKey
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, role, outlet_ids]
+              additionalProperties: false
+              properties:
+                name: { type: string, maxLength: 80 }
+                role: { type: string, enum: [cashier, manager] }
+                outlet_ids:
+                  type: array
+                  minItems: 1
+                  items: { type: string, format: uuid }
+      responses:
+        "201":
+          description: Key with its one-time secret
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiKey" }
+
+  /v1/api-keys/{id}:
+    delete:
+      tags: [ApiKeys]
+      summary: Revoke an API key
+      description: Admin only. Takes effect immediately.
+      operationId: revokeApiKey
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/id"
+      responses:
+        "200":
+          description: The revoked key
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiKey" }
+        "404":
+          $ref: "#/components/responses/Error"
+
 components:
   securitySchemes:
     bearerAuth:
       type: http
       scheme: bearer
       bearerFormat: JWT
+      description: A staff JWT from /v1/auth/login, or a machine API key (till_live_<prefix>_<secret>) from POST /v1/api-keys.
 
   parameters:
     id:
@@ -1024,6 +1219,11 @@ components:
       in: query
       name: limit
       schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+    cursor:
+      in: query
+      name: cursor
+      description: Opaque value from the previous page next_cursor.
+      schema: { type: string }
     idempotencyKey:
       in: header
       name: Idempotency-Key
@@ -1038,6 +1238,27 @@ components:
           schema: { $ref: "#/components/schemas/Error" }
 
   schemas:
+    NextCursor:
+      type: string
+      nullable: true
+      description: Pass as ?cursor= for the next page. null on the last page.
+    ApiKey:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        prefix: { type: string }
+        role: { type: string, enum: [cashier, manager] }
+        outlet_ids:
+          type: array
+          items: { type: string, format: uuid }
+        staff_id: { type: string, format: uuid }
+        created_by: { type: string, format: uuid }
+        created_at: { type: string, format: date-time }
+        last_used_at: { type: string, format: date-time, nullable: true }
+        revoked_at: { type: string, format: date-time, nullable: true }
+        secret: { type: string, description: Only in the create response }
+
     Error:
       type: object
       required: [error]

@@ -1,0 +1,10 @@
+.git
+.github
+.gotmp
+.env
+*.exe
+*.test
+*.out
+brag-output
+docs/*.pdf
+tests
