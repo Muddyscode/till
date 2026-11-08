@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -122,6 +123,7 @@ func (c *apiClient) do(method, path string, body any, extra http.Header) *http.R
 			req.Header.Set(k, v)
 		}
 	}
+	autoKey(req)
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
 		c.t.Fatal(err)
@@ -144,11 +146,27 @@ func (c *apiClient) doRaw(method, path, raw string, extra http.Header) *http.Res
 			req.Header.Set(k, v)
 		}
 	}
+	autoKey(req)
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
 		c.t.Fatal(err)
 	}
 	return res
+}
+
+// autoKey adds a fresh Idempotency-Key to the endpoints that now require one
+// (stock receipts/adjustments, product PATCH) so older tests keep their shape.
+// A test that wants no key sets X-Test-No-Key.
+func autoKey(req *http.Request) {
+	if req.Header.Get("X-Test-No-Key") != "" {
+		req.Header.Del("X-Test-No-Key")
+		return
+	}
+	needs := req.Method == http.MethodPatch && strings.HasPrefix(req.URL.Path, "/v1/products/") ||
+		req.Method == http.MethodPost && strings.HasPrefix(req.URL.Path, "/v1/stock/")
+	if needs && req.Header.Get("Idempotency-Key") == "" {
+		req.Header.Set("Idempotency-Key", "auto-"+uuid.NewString())
+	}
 }
 
 func decode(t *testing.T, res *http.Response, dest any) {

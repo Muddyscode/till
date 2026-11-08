@@ -49,7 +49,7 @@ func main() {
 		}
 	}
 
-	go checkout.RunSweeper(ctx, st, 30*time.Second)
+	go checkout.RunSweeper(ctx, st, 30*time.Second, log)
 
 	api := httpserver.New(cfg, st, log)
 	srv := &http.Server{

@@ -26,17 +26,21 @@ type Merchant struct {
 	WalletAccountID        *uuid.UUID
 	GoodsReceivedAccountID *uuid.UUID
 	AdjustmentAccountID    *uuid.UUID
+	SuspenseAccountID      *uuid.UUID
+	RefundsPayableID       *uuid.UUID
 	CreatedAt              time.Time
 }
 
 const merchantCols = `id, name, vat_inclusive_bps, clearing_account_id, vat_account_id, equity_account_id,
-	inventory_account_id, cogs_account_id, wallet_account_id, goods_received_account_id, adjustment_account_id, created_at`
+	inventory_account_id, cogs_account_id, wallet_account_id, goods_received_account_id, adjustment_account_id,
+	suspense_account_id, refunds_payable_account_id, created_at`
 
 func scanMerchant(sc interface{ Scan(...any) error }) (Merchant, error) {
 	var m Merchant
 	err := sc.Scan(
 		&m.ID, &m.Name, &m.VATInclusiveBps, &m.ClearingAccountID, &m.VATAccountID, &m.EquityAccountID,
-		&m.InventoryAccountID, &m.COGSAccountID, &m.WalletAccountID, &m.GoodsReceivedAccountID, &m.AdjustmentAccountID, &m.CreatedAt,
+		&m.InventoryAccountID, &m.COGSAccountID, &m.WalletAccountID, &m.GoodsReceivedAccountID, &m.AdjustmentAccountID,
+		&m.SuspenseAccountID, &m.RefundsPayableID, &m.CreatedAt,
 	)
 	return m, err
 }
@@ -84,25 +88,31 @@ type OrderLine struct {
 }
 
 type Order struct {
-	ID             uuid.UUID
-	MerchantID     uuid.UUID
-	OutletID       uuid.UUID
-	StaffID        uuid.UUID
-	Status         string
-	PaymentMethod  string
-	Currency       string
-	TotalMinor     int64
-	VATMinor       int64
-	NetMinor       int64
-	DiscountMinor  int64
-	CostMinor      int64
-	CustomerID     *uuid.UUID
-	Reference      string
-	IdempotencyKey string
-	JournalID      *uuid.UUID
-	ExpiresAt      *time.Time
-	PaidAt         *time.Time
-	CreatedAt      time.Time
+	ID              uuid.UUID
+	MerchantID      uuid.UUID
+	OutletID        uuid.UUID
+	StaffID         uuid.UUID
+	Status          string
+	PaymentMethod   string
+	Currency        string
+	TotalMinor      int64
+	VATMinor        int64
+	NetMinor        int64
+	DiscountMinor   int64
+	CostMinor       int64
+	CustomerID      *uuid.UUID
+	Reference       string
+	IdempotencyKey  string
+	JournalID       *uuid.UUID
+	ExpiresAt       *time.Time
+	PaidAt          *time.Time
+	CreatedAt       time.Time
+	RefundJournalID *uuid.UUID
+	RefundedAt      *time.Time
+	RefundedBy      *uuid.UUID
+	RefundReason    string
+	// RefundRecordID is set by checkout.Refund for transfer sales (not stored on the order).
+	RefundRecordID *uuid.UUID
 	Lines          []OrderLine
 }
 
@@ -185,7 +195,8 @@ func (s *Store) EnsureBooks(ctx context.Context, tx pgx.Tx, merchantID uuid.UUID
 	}
 	if m.ClearingAccountID != nil && m.VATAccountID != nil && m.EquityAccountID != nil &&
 		m.InventoryAccountID != nil && m.COGSAccountID != nil && m.WalletAccountID != nil &&
-		m.GoodsReceivedAccountID != nil && m.AdjustmentAccountID != nil {
+		m.GoodsReceivedAccountID != nil && m.AdjustmentAccountID != nil &&
+		m.SuspenseAccountID != nil && m.RefundsPayableID != nil {
 		return m, nil
 	}
 	type spec struct {
@@ -200,6 +211,8 @@ func (s *Store) EnsureBooks(ctx context.Context, tx pgx.Tx, merchantID uuid.UUID
 		{"2100", "VAT payable", ledger.Liability, false, &m.VATAccountID},
 		{"2150", "Goods received", ledger.Liability, false, &m.GoodsReceivedAccountID},
 		{"2200", "Customer wallet", ledger.Liability, false, &m.WalletAccountID},
+		{"2300", "Payment suspense", ledger.Liability, false, &m.SuspenseAccountID},
+		{"2310", "Refunds payable", ledger.Liability, false, &m.RefundsPayableID},
 		{"3000", "Opening equity", ledger.Equity, false, &m.EquityAccountID},
 		{"5000", "Cost of goods sold", ledger.Expense, false, &m.COGSAccountID},
 		{"5200", "Inventory adjustment", ledger.Expense, true, &m.AdjustmentAccountID},
@@ -240,11 +253,14 @@ func (s *Store) EnsureBooks(ctx context.Context, tx pgx.Tx, merchantID uuid.UUID
 			cogs_account_id = $6,
 			wallet_account_id = $7,
 			goods_received_account_id = $8,
-			adjustment_account_id = $9
+			adjustment_account_id = $9,
+			suspense_account_id = $10,
+			refunds_payable_account_id = $11
 		WHERE id = $1
 		RETURNING `+merchantCols+`
 	`, merchantID, m.ClearingAccountID, m.VATAccountID, m.EquityAccountID,
-		m.InventoryAccountID, m.COGSAccountID, m.WalletAccountID, m.GoodsReceivedAccountID, m.AdjustmentAccountID))
+		m.InventoryAccountID, m.COGSAccountID, m.WalletAccountID, m.GoodsReceivedAccountID, m.AdjustmentAccountID,
+		m.SuspenseAccountID, m.RefundsPayableID))
 }
 
 func (s *Store) CreateStaff(ctx context.Context, db DBTX, st Staff) (Staff, error) {
@@ -689,6 +705,7 @@ func scanOrder(sc interface{ Scan(...any) error }) (Order, error) {
 		&o.TotalMinor, &o.VATMinor, &o.NetMinor, &o.DiscountMinor, &o.CostMinor, &o.CustomerID,
 		&o.Reference, &o.IdempotencyKey, &o.JournalID,
 		&o.ExpiresAt, &o.PaidAt, &o.CreatedAt,
+		&o.RefundJournalID, &o.RefundedAt, &o.RefundedBy, &o.RefundReason,
 	)
 	return o, err
 }
@@ -696,7 +713,8 @@ func scanOrder(sc interface{ Scan(...any) error }) (Order, error) {
 const orderSelect = `id, merchant_id, outlet_id, staff_id, status, payment_method, currency,
 	total_minor, vat_minor, net_minor, discount_minor, cost_minor, customer_id,
 	reference, COALESCE(idempotency_key, ''), journal_id,
-	expires_at, paid_at, created_at`
+	expires_at, paid_at, created_at,
+	refund_journal_id, refunded_at, refunded_by, COALESCE(refund_reason, '')`
 
 func (s *Store) InsertOrder(ctx context.Context, tx pgx.Tx, o Order) error {
 	_, err := tx.Exec(ctx, `
@@ -835,8 +853,12 @@ func (s *Store) ListOrders(ctx context.Context, db DBTX, merchantID uuid.UUID, o
 	return s.loadLines(ctx, db, out)
 }
 
-func (s *Store) MarkRefunded(ctx context.Context, tx pgx.Tx, orderID uuid.UUID) error {
-	tag, err := tx.Exec(ctx, `UPDATE orders SET status = 'refunded' WHERE id = $1 AND status = 'paid'`, orderID)
+func (s *Store) MarkRefunded(ctx context.Context, tx pgx.Tx, orderID, journalID, staffID uuid.UUID, reason string, at time.Time) error {
+	tag, err := tx.Exec(ctx, `
+		UPDATE orders
+		SET status = 'refunded', refund_journal_id = $2, refunded_by = $3, refund_reason = NULLIF($4, ''), refunded_at = $5
+		WHERE id = $1 AND status = 'paid'
+	`, orderID, journalID, staffID, reason, at)
 	if err != nil {
 		return err
 	}
@@ -908,11 +930,11 @@ func (s *Store) InsertPayment(ctx context.Context, tx pgx.Tx, id, orderID uuid.U
 	return err
 }
 
-func (s *Store) ConfirmPayment(ctx context.Context, tx pgx.Tx, orderID, journalID uuid.UUID) error {
+func (s *Store) ConfirmPayment(ctx context.Context, tx pgx.Tx, orderID, journalID uuid.UUID, eventID *string) error {
 	tag, err := tx.Exec(ctx, `
-		UPDATE payments SET status = 'confirmed', journal_id = $2
+		UPDATE payments SET status = 'confirmed', journal_id = $2, provider_event_id = $3
 		WHERE order_id = $1 AND status = 'pending'
-	`, orderID, journalID)
+	`, orderID, journalID, eventID)
 	if err != nil {
 		return err
 	}
@@ -985,6 +1007,48 @@ func (s *Store) LockExpiredOrders(ctx context.Context, tx pgx.Tx, now time.Time,
 		out = append(out, o)
 	}
 	return out, rows.Err()
+}
+
+// ExpiredOrderIDs lists pending orders past their hold, oldest first, without
+// locking them. The sweeper locks and re-checks each one in its own transaction.
+func (s *Store) ExpiredOrderIDs(ctx context.Context, db DBTX, now time.Time, limit int, skip []uuid.UUID) ([]uuid.UUID, error) {
+	if skip == nil {
+		skip = []uuid.UUID{}
+	}
+	rows, err := db.Query(ctx, `
+		SELECT id FROM orders
+		WHERE status = 'pending_payment' AND expires_at < $1 AND NOT (id = ANY($3))
+		ORDER BY expires_at, id
+		LIMIT $2
+	`, now, limit, skip)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+// LockExpiredOrder locks one order if it is still pending and past its hold.
+// ok is false when another transaction owns it or it was paid in the meantime.
+func (s *Store) LockExpiredOrder(ctx context.Context, tx pgx.Tx, id uuid.UUID, now time.Time) (Order, bool, error) {
+	o, err := scanOrder(tx.QueryRow(ctx, `
+		SELECT `+orderSelect+`
+		FROM orders
+		WHERE id = $1 AND status = 'pending_payment' AND expires_at < $2
+		FOR UPDATE SKIP LOCKED
+	`, id, now))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Order{}, false, nil
+	}
+	return o, err == nil, err
 }
 
 func (s *Store) DailySales(ctx context.Context, db DBTX, outletID uuid.UUID, day string) (DailySales, error) {

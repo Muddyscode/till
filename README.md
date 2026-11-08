@@ -49,11 +49,20 @@ The order is `paid`. The response is `201`. Audit action: `order.paid`.
 
 **Transfer.** The same transaction does not touch `on_hand` and does not post a sale. It increases `reserved`, stores the order as `pending_payment`, and holds the units for `TILL_HOLD_MINUTES` (default 15). Unconfirmed money is not revenue. There is no manager "mark paid" button. The webhook is the only writer of that sale journal. Cost of goods is snapshotted when the webhook pays, not when the hold starts, because a receipt can change the average during the hold.
 
-**Webhook.** `POST /v1/webhooks/paystack` with header `x-paystack-signature` set to the hex HMAC-SHA512 of the raw body, keyed with `TILL_PAYSTACK_SECRET`. The amount is kobo, and it must match the amount the customer pays (the shelf total minus any discount). Only `charge.success` can post. A bad signature is `401` and changes nothing. An unknown reference, or an amount or currency that does not match the order, returns `200` with `{"status":"ignored"}` and an audit row. It does not post and it does not touch stock. A matching event posts one journal (debit Paystack clearing `1100`, credit outlet sales, credit VAT, plus cost of goods when the average is above zero), commits the reservation, and marks the order paid. Sending the same `data.id` again does not add a second journal. An expired or already-paid order is ignored (`webhook.order_not_pending`).
+**Webhook.** `POST /v1/webhooks/paystack` with header `x-paystack-signature` set to the hex HMAC-SHA512 of the raw body, keyed with `TILL_PAYSTACK_SECRET`. The amount is kobo. Only `charge.success` can post. A bad signature is `401` and changes nothing. Every signature-valid `charge.success` is recorded once in `provider_events` (primary key `(provider, event_id)`, the Paystack `data.id`); sending the same id again replays the stored response with `Idempotent-Replayed: true` and posts nothing. A matching event on a pending order for the right amount in NGN posts one journal (debit Paystack clearing `1100`, credit outlet sales, credit VAT, plus cost of goods when the average is above zero), commits the reservation, marks the order paid and stores the event id on `payments.provider_event_id`.
 
-**Refund.** A manager or admin restocks and reverses the sale journal in one transaction. That reversal puts the snapshotted cost back into inventory. It does not recompute the average, so a receipt that landed during the sale can leave quantity times average a few kobo away from the inventory account until the next receipt or a manual average change. `POST /v1/journals/{id}/reversal` refuses a journal that belongs to an order (`409 refund_via_order`). Refund the order so the shelf and the books move together.
+**Late or mismatched money is never dropped.** If the reference matches an order but the payment cannot be applied (order expired, already paid, refunded, wrong amount, wrong currency), the webhook posts Dr Paystack clearing `1100` / Cr Payment suspense `2300` and opens an `unmatched_payments` row (`open`). A reference that matches no order has no merchant to post to, so only the `provider_events` row and an audit row are written. Managers and admins resolve open rows (all need `Idempotency-Key`):
 
-**Expiry.** Every 30 seconds a sweeper locks due holds with `FOR UPDATE SKIP LOCKED`, releases `reserved`, sets the order to `expired`, and writes `reservation.released`. It does not post a journal.
+- `GET /v1/unmatched-payments?outlet_id=&status=`
+- `POST /v1/unmatched-payments/{id}/apply` turns the money into the paid sale. It works only for an expired order, when the amount equals the order total and the stock is available again; otherwise `409`. The sale journal debits `2300` instead of clearing.
+- `POST /v1/unmatched-payments/{id}/refund` moves it to `refund_pending`: Dr `2300` / Cr Refunds payable `2310`.
+- `POST /v1/unmatched-payments/{id}/refunded` records the payout: Dr `2310` / Cr `1100`.
+
+**Refund.** A manager or admin restocks and reverses the sale journal in one transaction; an optional `reason` is stored with `refund_journal_id`, `refunded_at` and `refunded_by` on the order. Products are locked in id order before stock. That reversal puts the snapshotted cost back into inventory. It does not recompute the average, so a receipt that landed during the sale can leave quantity times average a few kobo away from the inventory account until the next receipt or a manual average change. If an account would go negative (for example the drawer was already banked) the answer is `409 refund_insufficient_funds` naming the account. A refunded **transfer** sale credits Refunds payable `2310` instead of clearing, because the money still has to leave through Paystack; the response carries `refund_record_id` and the same unmatched-payments record (`reason: order_refund`, `refund_pending`) is closed with `POST /v1/unmatched-payments/{id}/refunded`. `POST /v1/journals/{id}/reversal` refuses a journal that belongs to an order (`409 refund_via_order`). Refund the order so the shelf and the books move together.
+
+**Control accounts.** Free-form `POST /v1/journals`, `POST /v1/transfers` and raw reversals refuse any line on the merchant's system accounts (`1100`, `1200`, `2100`, `2150`, `2200`, `2300`, `2310`, `5000`) with `409 control_account`. They move only through sales, receipts, top-ups and the flows above. (Paying a supplier from cash against `2150` therefore needs its own flow; it is no longer a free-form transfer.)
+
+**Expiry.** Every 30 seconds a sweeper finds due holds and releases each one in its own transaction (stock rows locked in product id order, deadlocks retried). Each release sets the order to `expired` and writes `reservation.released`; it posts no journal. A failing order is logged with `slog` and skipped for that tick so it cannot starve the others. The same loop deletes `idempotency_keys` older than 30 days (at most hourly).
 
 ## Staff and outlets
 
@@ -82,13 +91,15 @@ Order references look like `IKJ-A1B2C3D4-000001`. The outlet code repeats across
 
 ## Idempotency
 
-`Idempotency-Key` is required on orders, refunds, wallet top-ups, transfers, journals, and reversals. The key is scoped to the merchant.
+`Idempotency-Key` is required on orders, refunds, wallet top-ups, transfers, journals, reversals, stock receipts, stock adjustments, product `PATCH` and the unmatched-payment actions. The key is scoped to the merchant and bound to a fingerprint of the HTTP method, the resolved path (ids included) and the canonical body (numbers are compared exactly, never as floats).
 
-- Same key and the same body: the stored response is returned. Stock is not deducted twice and the journal is not posted twice.
-- Same key and a different body: `409 idempotency_conflict`.
+- Same key and the same request: the stored response is returned with `Idempotent-Replayed: true`. Stock is not deducted twice and the journal is not posted twice.
+- Same key on a different order, customer, endpoint or body: `409 idempotency_conflict`.
 - A key that is still inside its transaction: `409 idempotency_in_progress`.
+- Keys starting with `wh:` or `sys:` (any case) are reserved for the system: `400 idempotency_key_reserved`.
+- Keys are kept for 30 days, then purged.
 
-The webhook's key is `wh:{data.id}` on the merchant that owns the order.
+Webhook dedupe does not use this table; see `provider_events` under Webhook.
 
 ## Reports
 
@@ -96,7 +107,7 @@ The webhook's key is `wh:{data.id}` on the merchant that owns the order.
 
 `GET /v1/reports/low-stock` and `GET /v1/reports/stock-on-hand` take `outlet_id`. Ikeja soap is seeded at 3 on hand with reorder level 5, so it is low. Surulere soap is 20 and is not.
 
-`GET /v1/invariants` is admin-only. `holds` is true when this identity is zero and the cached balances match the journal:
+`GET /v1/invariants` is admin-only and returns `checks`, each with `name`, `holds`, `expected`, `actual`. `holds` is true when every check holds. Besides the identity below and the cached balances matching the journal, it checks that wallet `2200` equals the sum of customer balances, suspense `2300` equals the open unmatched payments, Refunds payable `2310` equals the refunds waiting for payout, and inventory `1200` is within one kobo per unit of the sum of `on_hand` times average cost (the check reports `residue_minor` and `tolerance_minor`, because average-cost rounding leaves a few kobo). The identity:
 
 ```text
 SUM(asset, expense) - SUM(liability, equity, income) = 0
@@ -233,6 +244,7 @@ The tests that protect the shop:
 - A wallet top-up, a wallet sale, and a refund move the customer balance and account `2200` together. The balance cannot be overdrawn
 - A receipt updates the weighted average, a sale posts cost of goods, and a manual average change revalues the units on hand
 - Audit records the actor. A refund restocks. A raw reversal of a sale journal is refused
+- Money safety (`tests/integration/money_safety_test.go`): idempotency keys are bound to method, path and body, webhook dedupe lives in `provider_events`, late or mismatched payments land in suspense and can be applied or refunded, control accounts refuse free-form postings, the database rejects unbalanced or late-added postings, and the sweeper skips a poison order
 - A stock adjustment cannot pass below reserved or below zero
 
 Ledger tests still reject unbalanced journals, JSON floats, and lost updates under concurrent transfers.

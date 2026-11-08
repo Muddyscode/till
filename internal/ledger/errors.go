@@ -38,6 +38,8 @@ const (
 	CodeOutletForbidden       = "outlet_forbidden"
 	CodeRefundViaOrder        = "refund_via_order"
 	CodeInvalidOrder          = "invalid_order"
+	CodeControlAccount        = "control_account"
+	CodeRefundInsufficient    = "refund_insufficient_funds"
 )
 
 func AsError(err error) *Error {

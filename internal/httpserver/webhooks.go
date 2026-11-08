@@ -19,6 +19,8 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+const providerPaystack = "paystack"
+
 type paystackBody struct {
 	Event string `json:"event"`
 	Data  struct {
@@ -65,77 +67,125 @@ func (s *Server) paystackWebhook(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ignored", "reason": "event"})
 		return
 	}
-	var eventID int64
-	if err := json.Unmarshal(ev.Data.ID, &eventID); err != nil || eventID <= 0 {
+	var rawID int64
+	if err := json.Unmarshal(ev.Data.ID, &rawID); err != nil || rawID <= 0 {
 		writeError(w, http.StatusBadRequest, "invalid_json", "data.id must be a positive integer")
 		return
 	}
+	eventID := strconv.FormatInt(rawID, 10)
 	amount, err := money.ParseJSONAmount(ev.Data.Amount)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, ledger.CodeInvalidAmount, "data.amount must be integer kobo")
 		return
 	}
 	ref := strings.TrimSpace(ev.Data.Reference)
-	order, err := s.store.GetOrderByReference(r.Context(), s.store.Pool, ref)
-	if err != nil {
-		meta, _ := json.Marshal(map[string]string{"reference": ref})
-		_ = s.withTx(r.Context(), func(tx pgx.Tx) error {
-			return s.store.InsertAudit(r.Context(), tx, store.AuditEvent{
-				Action: "webhook.unknown_reference", EntityType: "webhook",
-				EntityID: uuid.Nil, Metadata: meta,
-			})
-		})
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ignored", "reason": "unknown_reference"})
-		return
-	}
 	currency := strings.ToUpper(strings.TrimSpace(ev.Data.Currency))
 	dataStatus := strings.ToLower(strings.TrimSpace(ev.Data.Status))
-	key := "wh:" + strconv.FormatInt(eventID, 10)
-	s.finishIdempotent(w, r, order.MerchantID, key, canonicalHash(raw), func(tx pgx.Tx) (int, []byte, *uuid.UUID, error) {
+
+	var result txResult
+	err = s.withTx(r.Context(), func(tx pgx.Tx) error {
+		result = txResult{}
+		prev, claimed, err := s.store.ClaimProviderEvent(r.Context(), tx, providerPaystack, eventID)
+		if err != nil {
+			return err
+		}
+		if !claimed {
+			result = txResult{status: http.StatusOK, body: []byte(`{"status":"duplicate"}`), replayed: true}
+			if prev.ResponseStatus != nil && len(prev.ResponseBody) > 0 {
+				result.status, result.body = *prev.ResponseStatus, prev.ResponseBody
+			}
+			return nil
+		}
+		finish := func(merchantID, orderID *uuid.UUID, outcome string, status int, body []byte) error {
+			if err := s.store.FinishProviderEvent(r.Context(), tx, providerPaystack, eventID, merchantID, orderID, outcome, status, body); err != nil {
+				return err
+			}
+			result = txResult{status: status, body: body}
+			return nil
+		}
+		order, err := s.store.GetOrderByReference(r.Context(), tx, ref)
+		if err != nil {
+			if le := ledger.AsError(err); le == nil || le.Code != ledger.CodeNotFound {
+				return err
+			}
+			// No merchant to post to: keep the event and an audit trail only.
+			meta, _ := json.Marshal(map[string]any{"reference": ref, "event_id": eventID, "amount": amount, "currency": currency})
+			if err := s.store.InsertAudit(r.Context(), tx, store.AuditEvent{
+				Action: "webhook.unknown_reference", EntityType: "webhook", EntityID: uuid.Nil, Metadata: meta,
+			}); err != nil {
+				return err
+			}
+			body, _ := json.Marshal(map[string]string{"status": "ignored", "reason": "unknown_reference"})
+			return finish(nil, nil, "unknown_reference", http.StatusOK, body)
+		}
+		mid := order.MerchantID
+		oid := order.ID
 		locked, err := s.store.LockOrder(r.Context(), tx, order.MerchantID, order.ID)
 		if err != nil {
-			return 0, nil, nil, err
+			return err
 		}
-		if locked.Status != "pending_payment" {
-			return s.ignoreWebhook(r, tx, locked, "webhook.order_not_pending", "order_not_pending")
+		if dataStatus != "success" {
+			body, _ := json.Marshal(map[string]string{"status": "ignored", "reason": "status_not_success"})
+			return finish(&mid, &oid, "ignored_status", http.StatusOK, body)
 		}
-		if amount != locked.TotalMinor || currency != "NGN" || dataStatus != "success" {
-			return s.ignoreWebhook(r, tx, locked, "webhook.amount_mismatch", "amount_mismatch")
-		}
-		outlet, err := s.store.GetOutlet(r.Context(), tx, locked.MerchantID, locked.OutletID)
-		if err != nil {
-			return 0, nil, nil, err
+		reason := ""
+		switch {
+		case locked.Status == "expired":
+			reason = "order_expired"
+		case locked.Status == "paid":
+			reason = "order_already_paid"
+		case locked.Status == "refunded":
+			reason = "order_refunded"
+		case currency != "NGN":
+			reason = "currency_mismatch"
+		case amount != locked.TotalMinor:
+			reason = "amount_mismatch"
 		}
 		merchant, err := s.store.EnsureBooks(r.Context(), tx, locked.MerchantID)
 		if err != nil {
-			return 0, nil, nil, err
+			return err
+		}
+		if reason != "" {
+			u, err := checkout.RecordUnmatched(r.Context(), tx, s.store, checkout.UnmatchedInput{
+				Merchant: merchant, Order: &locked, Provider: providerPaystack, EventID: eventID,
+				Currency: currency, Reason: reason, Amount: amount, Now: time.Now(),
+			})
+			if err != nil {
+				return err
+			}
+			body, err := json.Marshal(map[string]string{
+				"status": "unmatched", "reason": reason, "unmatched_payment_id": u.ID.String(),
+			})
+			if err != nil {
+				return err
+			}
+			return finish(&mid, &oid, "unmatched:"+reason, http.StatusOK, body)
+		}
+		outlet, err := s.store.GetOutlet(r.Context(), tx, locked.MerchantID, locked.OutletID)
+		if err != nil {
+			return err
 		}
 		confirmed, err := checkout.ConfirmTransfer(r.Context(), tx, s.store, checkout.ConfirmInput{
-			Merchant: merchant, Outlet: outlet, Order: locked, Now: time.Now(), IdempotencyKey: key,
+			Merchant: merchant, Outlet: outlet, Order: locked, Now: time.Now(),
+			IdempotencyKey: "wh:" + providerPaystack + ":" + eventID, ProviderEventID: eventID,
 		})
 		if err != nil {
-			return 0, nil, nil, err
+			return err
 		}
 		body, err := json.Marshal(orderBody(confirmed))
 		if err != nil {
-			return 0, nil, nil, err
+			return err
 		}
-		return http.StatusOK, body, confirmed.JournalID, nil
+		return finish(&mid, &oid, "paid", http.StatusOK, body)
 	})
-}
-
-func (s *Server) ignoreWebhook(r *http.Request, tx pgx.Tx, order store.Order, action, reason string) (int, []byte, *uuid.UUID, error) {
-	meta, err := json.Marshal(map[string]any{"reference": order.Reference, "reason": reason})
 	if err != nil {
-		return 0, nil, nil, err
+		writeLedgerError(w, err)
+		return
 	}
-	mid := order.MerchantID
-	outlet := order.OutletID
-	if err := s.store.InsertAudit(r.Context(), tx, store.AuditEvent{
-		MerchantID: &mid, Action: action, EntityType: "order", EntityID: order.ID, OutletID: &outlet, Metadata: meta,
-	}); err != nil {
-		return 0, nil, nil, err
+	w.Header().Set("Content-Type", "application/json")
+	if result.replayed {
+		w.Header().Set("Idempotent-Replayed", "true")
 	}
-	body, _ := json.Marshal(map[string]string{"status": "ignored", "reason": reason})
-	return http.StatusOK, body, nil, nil
+	w.WriteHeader(result.status)
+	_, _ = w.Write(append(result.body, '\n'))
 }

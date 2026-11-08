@@ -292,7 +292,7 @@ func TestTransferReservesUntilWebhook(t *testing.T) {
 		t.Fatal("journal written before payment")
 	}
 
-	body := []byte(fmt.Sprintf(`{"event":"charge.success","data":{"id":9001,"reference":%q,"amount":200000,"currency":"NGN","status":"success"}}`, out["reference"]))
+	body := []byte(fmt.Sprintf(`{"event":"charge.success","data":{"id":%d,"reference":%q,"amount":200000,"currency":"NGN","status":"success"}}`, nextEvent(), out["reference"]))
 	h := http.Header{}
 	h.Set("x-paystack-signature", httpserver.SignPaystack("test-paystack-secret", body))
 	paid := sh.admin.doRaw(http.MethodPost, "/v1/webhooks/paystack", string(body), h)
@@ -323,7 +323,7 @@ func TestWebhookRejectsBadSignatureAndWrongAmount(t *testing.T) {
 	if res.StatusCode != 201 {
 		t.Fatal(out)
 	}
-	body := []byte(fmt.Sprintf(`{"event":"charge.success","data":{"id":42,"reference":%q,"amount":100000,"currency":"NGN","status":"success"}}`, out["reference"]))
+	body := []byte(fmt.Sprintf(`{"event":"charge.success","data":{"id":%d,"reference":%q,"amount":100000,"currency":"NGN","status":"success"}}`, nextEvent(), out["reference"]))
 	h := http.Header{}
 	h.Set("x-paystack-signature", "deadbeef")
 	bad := sh.admin.doRaw(http.MethodPost, "/v1/webhooks/paystack", string(body), h)
@@ -334,7 +334,7 @@ func TestWebhookRejectsBadSignatureAndWrongAmount(t *testing.T) {
 	if stockField(t, sh.admin, sh.ikeja, "SERUM", "reserved") != 1 {
 		t.Fatal("bad signature touched stock")
 	}
-	wrong := []byte(fmt.Sprintf(`{"event":"charge.success","data":{"id":43,"reference":%q,"amount":50,"currency":"NGN","status":"success"}}`, out["reference"]))
+	wrong := []byte(fmt.Sprintf(`{"event":"charge.success","data":{"id":%d,"reference":%q,"amount":50,"currency":"NGN","status":"success"}}`, nextEvent(), out["reference"]))
 	h2 := http.Header{}
 	h2.Set("x-paystack-signature", httpserver.SignPaystack("test-paystack-secret", wrong))
 	ig := sh.admin.doRaw(http.MethodPost, "/v1/webhooks/paystack", string(wrong), h2)

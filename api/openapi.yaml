@@ -23,6 +23,7 @@ tags:
   - name: Customers
   - name: Orders
   - name: Payments
+  - name: Unmatched payments
   - name: Reports
   - name: Audit
   - name: Staff
@@ -209,10 +210,12 @@ paths:
         Changing avg_cost_minor while units are on hand posts the difference to inventory (1200)
         and inventory adjustment (5200). An increase credits 5200, which is allowed to go negative.
         That journal is not a cash transfer. A refund does not recompute the average.
+        Requires Idempotency-Key. The product row is locked inside the transaction and the patch is applied to the locked row.
       operationId: patchProduct
       security: [{ bearerAuth: [] }]
       parameters:
         - $ref: "#/components/parameters/id"
+        - $ref: "#/components/parameters/idempotencyKey"
       requestBody:
         required: true
         content:
@@ -232,10 +235,20 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Product" }
+          headers:
+            Idempotent-Replayed: { $ref: "#/components/headers/IdempotentReplayed" }
         "400":
-          $ref: "#/components/responses/Error"
+          description: invalid_amount, invalid_order, idempotency_key_required, or idempotency_key_reserved
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "404":
           $ref: "#/components/responses/Error"
+        "409":
+          description: idempotency_conflict or idempotency_in_progress
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /v1/stock/receipts:
     post:
@@ -246,8 +259,11 @@ paths:
         unit_cost_minor is optional integer kobo. Omit it and the current average is used, with no journal when that average is 0.
         Explicit 0 pulls the weighted average down and books nothing.
         A positive booked cost debits inventory (1200) and credits goods received (2150). It does not take cash from the drawer.
+        Requires Idempotency-Key, so a retried receipt cannot double the stock.
       operationId: receiveStock
       security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/idempotencyKey"
       requestBody:
         required: true
         content:
@@ -281,8 +297,11 @@ paths:
       description: |
         Admin or manager. reason is required. delta 0 is rejected. The result cannot pass below reserved or below zero.
         When the average cost is above zero, the same transaction debits or credits inventory at that average against account 5200.
+        Requires Idempotency-Key.
       operationId: adjustStock
       security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/idempotencyKey"
       requestBody:
         required: true
         content:
@@ -524,20 +543,40 @@ paths:
     post:
       tags: [Orders]
       summary: Refund a paid order
-      description: Admin or manager. Restocks and reverses the sale journal in one transaction. A wallet sale also puts the paid amount back on the customer balance. The average cost is not recomputed. Requires Idempotency-Key. Body may be empty or {}.
+      description: |
+        Admin or manager. Restocks and reverses the sale journal in one transaction. A wallet sale also puts the paid amount back on the customer balance. The average cost is not recomputed.
+        Requires Idempotency-Key. Body may be empty, {} or an object with an optional reason.
+        The order records refund_journal_id, refunded_at, refunded_by and refund_reason.
+        A transfer (Paystack) sale credits Refunds payable 2310 instead of clearing 1100 and returns refund_record_id,
+        an unmatched payment in refund_pending. Close it with POST /v1/unmatched-payments/{id}/refunded once the money has left the provider.
+        If an account would go negative the answer is 409 refund_insufficient_funds, naming the account.
       operationId: refundOrder
       security: [{ bearerAuth: [] }]
       parameters:
         - $ref: "#/components/parameters/id"
         - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                reason: { type: string, maxLength: 200 }
       responses:
         "201":
           description: Order status is refunded
+          headers:
+            Idempotent-Replayed: { $ref: "#/components/headers/IdempotentReplayed" }
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Order" }
         "409":
-          $ref: "#/components/responses/Error"
+          description: refund_insufficient_funds, already_reversed, idempotency_conflict, or idempotency_in_progress
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /v1/webhooks/paystack:
     post:
@@ -548,8 +587,12 @@ paths:
         using TILL_PAYSTACK_SECRET. Amount is integer kobo.
         Only event charge.success can post a sale.
         Bad signature is 401 and changes nothing.
-        Unknown reference, amount mismatch, or an order that is not pending_payment
-        returns 200 with status ignored and writes an audit row.
+        Every signature-valid charge.success is recorded once in provider_events (provider, event id);
+        a repeat of the same id replays the stored response with Idempotent-Replayed true and posts nothing.
+        A reference that matches no order returns 200 status ignored, reason unknown_reference (event and audit row only).
+        A reference that matches an order but cannot be applied (order_expired, order_already_paid, order_refunded,
+        amount_mismatch, currency_mismatch) returns 200 status unmatched: Dr 1100 Paystack clearing / Cr 2300 Payment suspense
+        and an open unmatched payment. See /v1/unmatched-payments.
       operationId: paystackWebhook
       parameters:
         - in: header
@@ -576,7 +619,9 @@ paths:
                     status: { type: string, example: success }
       responses:
         "200":
-          description: Paid order, or an ignored event
+          description: Paid order, an unmatched payment, or an ignored event
+          headers:
+            Idempotent-Replayed: { $ref: "#/components/headers/IdempotentReplayed" }
           content:
             application/json:
               schema:
@@ -584,10 +629,111 @@ paths:
                   - $ref: "#/components/schemas/Order"
                   - type: object
                     properties:
-                      status: { type: string, example: ignored }
-                      reason: { type: string, example: amount_mismatch }
+                      status: { type: string, enum: [ignored, unmatched, duplicate] }
+                      reason: { type: string, example: order_expired }
+                      unmatched_payment_id: { type: string, format: uuid }
         "401":
           description: invalid signature
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/unmatched-payments:
+    get:
+      tags: [Unmatched payments]
+      summary: List payments that could not be applied
+      description: Admin or manager. Managers must pass outlet_id for an outlet they are assigned to. Includes refunded transfer sales (reason order_refund).
+      operationId: listUnmatchedPayments
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/outletId"
+        - in: query
+          name: status
+          schema: { type: string, enum: [open, applied, refund_pending, refunded] }
+        - $ref: "#/components/parameters/limit"
+      responses:
+        "200":
+          description: Unmatched payments, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  unmatched_payments:
+                    type: array
+                    items: { $ref: "#/components/schemas/UnmatchedPayment" }
+        "400":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+
+  /v1/unmatched-payments/{id}/apply:
+    post:
+      tags: [Unmatched payments]
+      summary: Apply an open payment to its (expired) order
+      description: |
+        Admin or manager. Requires Idempotency-Key. Works only when the order is expired, the payment is NGN,
+        the amount equals the order total and the stock is available again. Re-runs the sale posting with Dr 2300 Payment suspense
+        instead of clearing. Otherwise 409 unmatched_not_applicable or insufficient_stock.
+      operationId: applyUnmatchedPayment
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/id"
+        - $ref: "#/components/parameters/idempotencyKey"
+      responses:
+        "200":
+          description: The payment (status applied) with the paid order under order
+          headers:
+            Idempotent-Replayed: { $ref: "#/components/headers/IdempotentReplayed" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UnmatchedPayment" }
+        "409":
+          description: unmatched_not_open, unmatched_not_applicable, insufficient_stock, or an idempotency conflict
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/unmatched-payments/{id}/refund:
+    post:
+      tags: [Unmatched payments]
+      summary: Queue an open payment for refund
+      description: Admin or manager. Requires Idempotency-Key. Status becomes refund_pending. Posts Dr 2300 Payment suspense / Cr 2310 Refunds payable.
+      operationId: refundUnmatchedPayment
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/id"
+        - $ref: "#/components/parameters/idempotencyKey"
+      responses:
+        "200":
+          description: The payment, now refund_pending
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UnmatchedPayment" }
+        "409":
+          description: unmatched_not_open or an idempotency conflict
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/unmatched-payments/{id}/refunded:
+    post:
+      tags: [Unmatched payments]
+      summary: Record that a queued refund was paid out
+      description: Admin or manager. Requires Idempotency-Key. Status becomes refunded. Posts Dr 2310 Refunds payable / Cr 1100 Paystack clearing. Also closes the refund of a transfer sale.
+      operationId: settleUnmatchedRefund
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/id"
+        - $ref: "#/components/parameters/idempotencyKey"
+      responses:
+        "200":
+          description: The payment, now refunded
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UnmatchedPayment" }
+        "409":
+          description: unmatched_not_refund_pending or an idempotency conflict
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -752,7 +898,11 @@ paths:
     get:
       tags: [Ledger]
       summary: Double-entry identity
-      description: Admin only. holds is true when identity_minor is 0 and cache_drift is 0.
+      description: |
+        Admin only, read from one snapshot. holds is true when every check holds: the trial-balance identity is 0, cached balances match the journal,
+        wallet 2200 equals the sum of customer balances, suspense 2300 equals the open unmatched payments,
+        refunds payable 2310 equals the refund_pending payments, and inventory 1200 is within one kobo per unit of sum(on_hand * avg_cost)
+        (residue_minor and tolerance_minor are reported for that check).
       operationId: invariants
       security: [{ bearerAuth: [] }]
       responses:
@@ -768,6 +918,17 @@ paths:
                   cache_drift: { type: integer }
                   accounts: { type: integer }
                   journals: { type: integer }
+                  checks:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name: { type: string }
+                        holds: { type: boolean }
+                        expected: { type: integer }
+                        actual: { type: integer }
+                        residue_minor: { type: integer }
+                        tolerance_minor: { type: integer }
 
   /v1/accounts:
     get:
@@ -862,7 +1023,7 @@ paths:
     post:
       tags: [Ledger]
       summary: Two-legged transfer
-      description: Admin only. Requires Idempotency-Key. Income cannot be the debit side except through a reversal.
+      description: Admin only. Requires Idempotency-Key. Income cannot be the debit side except through a reversal. A line on a system account (1100, 1200, 2100, 2150, 2200, 2300, 2310, 5000) is 409 control_account.
       operationId: postTransfer
       security: [{ bearerAuth: [] }]
       parameters:
@@ -923,7 +1084,7 @@ paths:
     post:
       tags: [Ledger]
       summary: Post a balanced journal
-      description: Admin only. Requires Idempotency-Key. 2 to 20 postings. Each account at most once. Debits must equal credits.
+      description: Admin only. Requires Idempotency-Key. 2 to 20 postings. Each account at most once. Debits must equal credits. A line on a system account (1100, 1200, 2100, 2150, 2200, 2300, 2310, 5000) is 409 control_account.
       operationId: postJournal
       security: [{ bearerAuth: [] }]
       parameters:
@@ -984,7 +1145,7 @@ paths:
     post:
       tags: [Ledger]
       summary: Reverse a journal by appending
-      description: Admin only. Requires Idempotency-Key. Does not update the original rows. A journal attached to an order returns 409 refund_via_order.
+      description: Admin only. Requires Idempotency-Key. Does not update the original rows. A journal attached to an order returns 409 refund_via_order. A reversal that would touch a system account is 409 control_account.
       operationId: reverseJournal
       security: [{ bearerAuth: [] }]
       parameters:
@@ -997,7 +1158,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Journal" }
         "409":
-          description: refund_via_order or already_reversed
+          description: refund_via_order, control_account, or already_reversed
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -1028,7 +1189,17 @@ components:
       in: header
       name: Idempotency-Key
       required: true
+      description: |
+        Scoped to the merchant and bound to the HTTP method, the resolved path and the canonical body.
+        The same key on another order, customer, endpoint or body is 409 idempotency_conflict.
+        A replay returns the stored response with header Idempotent-Replayed true.
+        Keys starting with wh: or sys: (any case) are reserved: 400 idempotency_key_reserved.
+        Keys are purged after 30 days.
       schema: { type: string, maxLength: 256 }
+  headers:
+    IdempotentReplayed:
+      description: Present and true when the response is a stored replay of an earlier identical request.
+      schema: { type: string, enum: ["true"] }
 
   responses:
     Error:
@@ -1133,6 +1304,30 @@ components:
         expires_at: { type: string, format: date-time }
         paid_at: { type: string, format: date-time }
         created_at: { type: string, format: date-time }
+        refund_journal_id: { type: string, format: uuid, description: Set once refunded }
+        refunded_at: { type: string, format: date-time }
+        refunded_by: { type: string, format: uuid }
+        refund_reason: { type: string }
+        refund_record_id: { type: string, format: uuid, description: Refund response for a transfer sale. The unmatched payment to settle. }
+
+    UnmatchedPayment:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        order_id: { type: string, format: uuid, nullable: true }
+        outlet_id: { type: string, format: uuid, nullable: true }
+        provider: { type: string, example: paystack }
+        event_id: { type: string, description: "Provider event id, or refund:{order id} for a refunded transfer sale" }
+        amount_minor: { type: integer }
+        currency: { type: string }
+        reason: { type: string, enum: [order_expired, order_already_paid, order_refunded, amount_mismatch, currency_mismatch, order_refund] }
+        status: { type: string, enum: [open, applied, refund_pending, refunded] }
+        created_at: { type: string, format: date-time }
+        resolved_at: { type: string, format: date-time, nullable: true }
+        resolved_by: { type: string, format: uuid, nullable: true }
+        journal_id: { type: string, format: uuid, nullable: true, description: "Dr 1100 / Cr 2300 on arrival (or the order reversal for order_refund)" }
+        resolution_journal_id: { type: string, format: uuid, nullable: true, description: "Sale journal (apply) or Dr 2300 / Cr 2310 (refund)" }
+        settlement_journal_id: { type: string, format: uuid, nullable: true, description: "Dr 2310 / Cr 1100" }
 
     DailySales:
       type: object

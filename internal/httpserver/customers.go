@@ -119,7 +119,7 @@ func (s *Server) topUpCustomer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	actor := s.staff(r)
-	s.finishIdempotent(w, r, actor.MerchantID, key, canonicalHash(raw), func(tx pgx.Tx) (int, []byte, *uuid.UUID, error) {
+	s.finishIdempotent(w, r, actor.MerchantID, key, fingerprint(r, raw), func(tx pgx.Tx) (int, []byte, *uuid.UUID, error) {
 		merchant, err := s.store.EnsureBooks(r.Context(), tx, actor.MerchantID)
 		if err != nil {
 			return 0, nil, nil, err

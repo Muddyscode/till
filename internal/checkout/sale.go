@@ -88,6 +88,24 @@ func totals(lines []SaleLine, bps int, discount int64) (payable, vat, net int64,
 	return payable, vat, net, built, nil
 }
 
+// refreshProducts locks the sale's products in id order and swaps the pre-lock
+// copies for the locked rows, so price and active are read under the lock.
+func refreshProducts(ctx context.Context, tx pgx.Tx, st *store.Store, merchantID uuid.UUID, lines []SaleLine) ([]SaleLine, error) {
+	ids := make([]uuid.UUID, len(lines))
+	for i, ln := range lines {
+		ids[i] = ln.Product.ID
+	}
+	locked, err := st.LockProducts(ctx, tx, merchantID, ids)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]SaleLine, len(lines))
+	for i, ln := range lines {
+		out[i] = SaleLine{Product: locked[ln.Product.ID], Qty: ln.Qty}
+	}
+	return out, nil
+}
+
 func lockProducts(ctx context.Context, tx pgx.Tx, st *store.Store, outlet uuid.UUID, lines []SaleLine) error {
 	ids := make([]uuid.UUID, len(lines))
 	for i, ln := range lines {
@@ -161,6 +179,11 @@ func payNow(ctx context.Context, tx pgx.Tx, st *store.Store, in SaleInput, metho
 		}
 	} else if in.CustomerID != nil {
 		return store.Order{}, ledger.Err(ledger.CodeInvalidOrder, "customer_id is only used for wallet payments")
+	}
+	var err error
+	in.Lines, err = refreshProducts(ctx, tx, st, in.Merchant.ID, in.Lines)
+	if err != nil {
+		return store.Order{}, err
 	}
 	payable, vat, net, lines, err := totals(in.Lines, in.Merchant.VATInclusiveBps, in.DiscountMinor)
 	if err != nil {
@@ -248,6 +271,11 @@ func ReserveTransfer(ctx context.Context, tx pgx.Tx, st *store.Store, in SaleInp
 	if in.CustomerID != nil {
 		return store.Order{}, ledger.Err(ledger.CodeInvalidOrder, "customer_id is only used for wallet payments")
 	}
+	lockedLines, err := refreshProducts(ctx, tx, st, in.Merchant.ID, in.Lines)
+	if err != nil {
+		return store.Order{}, err
+	}
+	in.Lines = lockedLines
 	if err := lockProducts(ctx, tx, st, in.Outlet.ID, in.Lines); err != nil {
 		return store.Order{}, err
 	}
@@ -312,6 +340,8 @@ type ConfirmInput struct {
 	Order          store.Order
 	Now            time.Time
 	IdempotencyKey string
+	// ProviderEventID is stored on the payment row (payments.provider_event_id).
+	ProviderEventID string
 }
 
 func ConfirmTransfer(ctx context.Context, tx pgx.Tx, st *store.Store, in ConfirmInput) (store.Order, error) {
@@ -351,7 +381,11 @@ func ConfirmTransfer(ctx context.Context, tx pgx.Tx, st *store.Store, in Confirm
 	if err := st.AttachJournal(ctx, tx, in.Order.ID, j.ID, in.Now); err != nil {
 		return store.Order{}, err
 	}
-	if err := st.ConfirmPayment(ctx, tx, in.Order.ID, j.ID); err != nil {
+	var eventID *string
+	if in.ProviderEventID != "" {
+		eventID = &in.ProviderEventID
+	}
+	if err := st.ConfirmPayment(ctx, tx, in.Order.ID, j.ID, eventID); err != nil {
 		return store.Order{}, err
 	}
 	in.Order.Status = "paid"
@@ -374,13 +408,23 @@ func ConfirmTransfer(ctx context.Context, tx pgx.Tx, st *store.Store, in Confirm
 	return in.Order, nil
 }
 
-func Refund(ctx context.Context, tx pgx.Tx, st *store.Store, merchant store.Merchant, order store.Order, staffID uuid.UUID, idemKey string) (store.Order, error) {
+// Refund reverses a paid order. Cash and wallet sales reverse exactly. A
+// transfer (Paystack) sale credits Refunds payable (2310) instead of clearing,
+// because the money has to be paid back out through the provider; the
+// matching refund_pending record is settled later through
+// POST /v1/unmatched-payments/{id}/refunded.
+func Refund(ctx context.Context, tx pgx.Tx, st *store.Store, merchant store.Merchant, order store.Order, staffID uuid.UUID, idemKey, reason string) (store.Order, error) {
 	if order.Status != "paid" || order.JournalID == nil {
 		return store.Order{}, ledger.Err(ledger.CodeInvalidOrder, "only a paid order can be refunded")
 	}
 	ids := make([]uuid.UUID, len(order.Lines))
 	for i, ln := range order.Lines {
 		ids[i] = ln.ProductID
+	}
+	// Products first (id order), then stock (product id order): the same order
+	// every sale and receipt uses, so they cannot deadlock with a refund.
+	if _, err := st.LockProducts(ctx, tx, merchant.ID, ids); err != nil {
+		return store.Order{}, err
 	}
 	if err := st.LockStock(ctx, tx, order.OutletID, ids); err != nil {
 		return store.Order{}, err
@@ -407,17 +451,39 @@ func Refund(ctx context.Context, tx pgx.Tx, st *store.Store, merchant store.Merc
 			return store.Order{}, err
 		}
 	}
+	lines := ledger.ReverseLines(orig.Postings)
+	transfer := order.PaymentMethod == "transfer"
+	if transfer {
+		if merchant.RefundsPayableID == nil || merchant.ClearingAccountID == nil || merchant.SuspenseAccountID == nil {
+			return store.Order{}, ledger.Err(ledger.CodeInvalidOrder, "merchant books are not set up")
+		}
+		swapped := false
+		for i := range lines {
+			a := lines[i].AccountID
+			if lines[i].Direction == ledger.Credit && (a == *merchant.ClearingAccountID || a == *merchant.SuspenseAccountID) {
+				lines[i].AccountID = *merchant.RefundsPayableID
+				swapped = true
+			}
+		}
+		if !swapped {
+			return store.Order{}, ledger.Err(ledger.CodeInvalidOrder, "transfer sale has no clearing line to refund")
+		}
+	}
 	j, err := ledger.Post(ctx, tx, poster(st), ledger.PostRequest{
 		MerchantID:        merchant.ID,
 		Description:       "refund " + order.Reference,
-		Lines:             ledger.ReverseLines(orig.Postings),
+		Lines:             lines,
 		ReversesJournalID: &orig.ID,
 		IdempotencyKey:    idemKey,
 	})
 	if err != nil {
+		if le := ledger.AsError(err); le != nil && le.Code == ledger.CodeInsufficientFunds {
+			return store.Order{}, ledger.Err(ledger.CodeRefundInsufficient, "refund cannot be posted: "+le.Message)
+		}
 		return store.Order{}, err
 	}
-	if err := st.MarkRefunded(ctx, tx, order.ID); err != nil {
+	now := time.Now()
+	if err := st.MarkRefunded(ctx, tx, order.ID, j.ID, staffID, reason, now); err != nil {
 		return store.Order{}, err
 	}
 	if order.PaymentMethod == "wallet" {
@@ -425,10 +491,30 @@ func Refund(ctx context.Context, tx pgx.Tx, st *store.Store, merchant store.Merc
 			return store.Order{}, err
 		}
 	}
+	if transfer {
+		rid, err := newID()
+		if err != nil {
+			return store.Order{}, err
+		}
+		oid, outlet := order.ID, order.OutletID
+		if err := st.InsertUnmatched(ctx, tx, store.Unmatched{
+			ID: rid, MerchantID: merchant.ID, OrderID: &oid, OutletID: &outlet,
+			Provider: "paystack", EventID: "refund:" + order.ID.String(),
+			AmountMinor: order.TotalMinor, Currency: "NGN", Reason: "order_refund",
+			Status: "refund_pending", CreatedAt: now, ResolvedAt: &now, ResolvedBy: &staffID, JournalID: &j.ID,
+		}); err != nil {
+			return store.Order{}, err
+		}
+		order.RefundRecordID = &rid
+	}
 	order.Status = "refunded"
+	order.RefundJournalID = &j.ID
+	order.RefundedAt = &now
+	order.RefundedBy = &staffID
+	order.RefundReason = reason
 	outletID := order.OutletID
 	if err := audit(ctx, tx, st, merchant.ID, staffID, &outletID, "order.refunded", "order", order.ID, map[string]any{
-		"reference": order.Reference, "reversal_journal_id": j.ID.String(),
+		"reference": order.Reference, "reversal_journal_id": j.ID.String(), "reason": reason,
 	}); err != nil {
 		return store.Order{}, err
 	}

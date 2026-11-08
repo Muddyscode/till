@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/Muddyscode/till/internal/ledger"
+	"github.com/Muddyscode/till/internal/store"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -147,16 +148,27 @@ func (s *Server) statement(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) invariants(w http.ResponseWriter, r *http.Request) {
-	idn, err := s.store.Identity(r.Context(), s.store.Pool, s.staff(r).MerchantID)
+	idn, checks, err := s.store.Invariants(r.Context(), s.staff(r).MerchantID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", "internal error")
 		return
 	}
+	all := append([]store.Check{
+		{Name: "trial_balance_identity", Holds: idn.IdentityMinor == 0, Expected: 0, Actual: idn.IdentityMinor},
+		{Name: "balance_cache_matches_journal", Holds: idn.CacheDrift == 0, Expected: 0, Actual: idn.CacheDrift},
+	}, checks...)
+	holds := true
+	for _, c := range all {
+		if !c.Holds {
+			holds = false
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"holds":          idn.IdentityMinor == 0 && idn.CacheDrift == 0,
+		"holds":          holds,
 		"identity_minor": idn.IdentityMinor,
 		"cache_drift":    idn.CacheDrift,
 		"accounts":       idn.Accounts,
 		"journals":       idn.Journals,
+		"checks":         all,
 	})
 }

@@ -22,7 +22,15 @@ type Spec struct {
 	Password string
 }
 
+// Run seeds the demo merchant under the same advisory lock the migrations use,
+// so two instances booting together cannot both create it.
 func Run(ctx context.Context, st *store.Store, spec Spec, log *slog.Logger) error {
+	return store.WithAdvisoryLock(ctx, st.Pool, func(ctx context.Context) error {
+		return run(ctx, st, spec, log)
+	})
+}
+
+func run(ctx context.Context, st *store.Store, spec Spec, log *slog.Logger) error {
 	if _, err := st.GetStaffByEmail(ctx, st.Pool, adminEmail); err == nil {
 		log.Info("seed already present", "email", adminEmail)
 		return nil

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/Muddyscode/till/internal/checkout"
 	"github.com/Muddyscode/till/internal/ledger"
 )
 
@@ -47,7 +48,9 @@ func statusFor(code string) int {
 	case ledger.CodeNotFound:
 		return http.StatusNotFound
 	case ledger.CodeIdempotencyConflict, ledger.CodeIdempotencyInProgress, ledger.CodeAlreadyReversed, "already_closed",
-		ledger.CodeInsufficientStock, ledger.CodeInsufficientWallet, ledger.CodeRefundViaOrder, "last_admin", "email_taken", "code_taken", "sku_taken", "phone_taken":
+		ledger.CodeInsufficientStock, ledger.CodeInsufficientWallet, ledger.CodeRefundViaOrder, "last_admin", "email_taken", "code_taken", "sku_taken", "phone_taken",
+		ledger.CodeControlAccount, ledger.CodeRefundInsufficient, checkout.CodeUnmatchedNotApplicable,
+		"unmatched_not_open", "unmatched_not_refund_pending":
 		return http.StatusConflict
 	case ledger.CodeForbidden, ledger.CodeOutletForbidden:
 		return http.StatusForbidden
@@ -56,20 +59,40 @@ func statusFor(code string) int {
 	}
 }
 
-func canonicalHash(raw []byte) []byte {
+// canonicalBody re-encodes JSON with sorted keys and numbers kept as written,
+// so key order and whitespace do not matter but a large integer never loses
+// precision (json.Number, not float64).
+func canonicalBody(raw []byte) []byte {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
 	var v any
-	if err := json.Unmarshal(raw, &v); err != nil {
-		sum := sha256.Sum256(raw)
-		return sum[:]
+	if err := dec.Decode(&v); err != nil {
+		return raw
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return raw
 	}
 	canon, err := json.Marshal(v)
 	if err != nil {
-		sum := sha256.Sum256(raw)
-		return sum[:]
+		return raw
 	}
-	sum := sha256.Sum256(canon)
-	return sum[:]
+	return canon
 }
+
+// fingerprint is what an Idempotency-Key is bound to: HTTP method, the
+// resolved route path (ids included) and the canonical body. The same key on a
+// different order, customer or endpoint is therefore a conflict, not a replay.
+func fingerprint(r *http.Request, raw []byte) []byte {
+	h := sha256.New()
+	h.Write([]byte(strings.ToUpper(r.Method)))
+	h.Write([]byte{0})
+	h.Write([]byte(strings.ToLower(r.URL.Path)))
+	h.Write([]byte{0})
+	h.Write(canonicalBody(raw))
+	return h.Sum(nil)
+}
+
+var reservedKeyPrefixes = []string{"wh:", "sys:"}
 
 func decodeStrict(raw []byte, dest any) error {
 	dec := json.NewDecoder(bytes.NewReader(raw))
@@ -91,6 +114,13 @@ func requireIdempotencyKey(w http.ResponseWriter, r *http.Request) (string, bool
 	if key == "" {
 		writeError(w, http.StatusBadRequest, "idempotency_key_required", "Idempotency-Key header is required")
 		return "", false
+	}
+	lower := strings.ToLower(key)
+	for _, p := range reservedKeyPrefixes {
+		if strings.HasPrefix(lower, p) {
+			writeError(w, http.StatusBadRequest, "idempotency_key_reserved", "Idempotency-Key prefix "+p+" is reserved")
+			return "", false
+		}
 	}
 	if len(key) > 256 {
 		writeError(w, http.StatusBadRequest, "idempotency_key_required", "Idempotency-Key is too long")

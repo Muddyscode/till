@@ -1,6 +1,7 @@
 package httpserver
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 
@@ -30,8 +31,9 @@ type journalReq struct {
 }
 
 type txResult struct {
-	status int
-	body   []byte
+	status   int
+	body     []byte
+	replayed bool
 }
 
 func (s *Server) postTransfer(w http.ResponseWriter, r *http.Request) {
@@ -63,7 +65,7 @@ func (s *Server) postTransfer(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, ledger.CodeInvalidAmount, err.Error())
 		return
 	}
-	s.postLines(w, r, key, canonicalHash(raw), in.Description, []ledger.Line{
+	s.postLines(w, r, key, fingerprint(r, raw), in.Description, []ledger.Line{
 		{AccountID: debitID, Direction: ledger.Debit, Amount: amount},
 		{AccountID: creditID, Direction: ledger.Credit, Amount: amount},
 	}, true, nil)
@@ -101,7 +103,7 @@ func (s *Server) postJournal(w http.ResponseWriter, r *http.Request) {
 			Amount:    amt,
 		})
 	}
-	s.postLines(w, r, key, canonicalHash(raw), in.Description, lines, false, nil)
+	s.postLines(w, r, key, fingerprint(r, raw), in.Description, lines, false, nil)
 }
 
 func (s *Server) reverseJournal(w http.ResponseWriter, r *http.Request) {
@@ -142,7 +144,7 @@ func (s *Server) reverseJournal(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, ledger.CodeAlreadyReversed, "journal already reversed")
 		return
 	}
-	s.postLines(w, r, key, canonicalHash(raw), "reversal of "+orig.ID.String(), ledger.ReverseLines(orig.Postings), false, &orig.ID)
+	s.postLines(w, r, key, fingerprint(r, raw), "reversal of "+orig.ID.String(), ledger.ReverseLines(orig.Postings), false, &orig.ID)
 }
 
 func (s *Server) postLines(w http.ResponseWriter, r *http.Request, key string, hash []byte, desc string, lines []ledger.Line, enforcePairs bool, reverses *uuid.UUID) {
@@ -154,8 +156,11 @@ func (s *Server) postLines(w http.ResponseWriter, r *http.Request, key string, h
 			return err
 		}
 		if rec.Replay {
-			result = txResult{status: rec.HTTPStatus, body: rec.Body}
+			result = txResult{status: rec.HTTPStatus, body: rec.Body, replayed: true}
 			return nil
+		}
+		if err := s.refuseControlAccounts(r.Context(), tx, op.MerchantID, lines); err != nil {
+			return err
 		}
 		j, err := ledger.Post(r.Context(), tx, s.poster(), ledger.PostRequest{
 			MerchantID:           op.MerchantID,
@@ -191,8 +196,37 @@ func (s *Server) postLines(w http.ResponseWriter, r *http.Request, key string, h
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
+	if result.replayed {
+		w.Header().Set("Idempotent-Replayed", "true")
+	}
 	w.WriteHeader(result.status)
 	_, _ = w.Write(append(result.body, '\n'))
+}
+
+// refuseControlAccounts blocks free-form journals, transfers and raw reversals
+// from touching the merchant's system accounts. Those move only through the
+// flows that keep stock, wallet balances and unmatched payments in step.
+func (s *Server) refuseControlAccounts(ctx context.Context, tx pgx.Tx, merchantID uuid.UUID, lines []ledger.Line) error {
+	m, err := s.store.GetMerchant(ctx, tx, merchantID)
+	if err != nil {
+		return err
+	}
+	control := map[uuid.UUID]string{}
+	for code, id := range map[string]*uuid.UUID{
+		"1100": m.ClearingAccountID, "1200": m.InventoryAccountID, "2100": m.VATAccountID,
+		"2150": m.GoodsReceivedAccountID, "2200": m.WalletAccountID, "2300": m.SuspenseAccountID,
+		"2310": m.RefundsPayableID, "5000": m.COGSAccountID,
+	} {
+		if id != nil {
+			control[*id] = code
+		}
+	}
+	for _, l := range lines {
+		if code, ok := control[l.AccountID]; ok {
+			return ledger.Err(ledger.CodeControlAccount, "account "+code+" is a system control account and cannot be posted to directly")
+		}
+	}
+	return nil
 }
 
 func (s *Server) getJournal(w http.ResponseWriter, r *http.Request) {

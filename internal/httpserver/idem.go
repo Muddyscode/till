@@ -15,7 +15,7 @@ func (s *Server) finishIdempotent(w http.ResponseWriter, r *http.Request, mercha
 			return err
 		}
 		if rec.Replay {
-			result = txResult{status: rec.HTTPStatus, body: rec.Body}
+			result = txResult{status: rec.HTTPStatus, body: rec.Body, replayed: true}
 			return nil
 		}
 		status, body, journalID, err := fn(tx)
@@ -37,6 +37,9 @@ func (s *Server) finishIdempotent(w http.ResponseWriter, r *http.Request, mercha
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
+	if result.replayed {
+		w.Header().Set("Idempotent-Replayed", "true")
+	}
 	w.WriteHeader(result.status)
 	_, _ = w.Write(append(result.body, '\n'))
 }

@@ -9,8 +9,43 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// migrationLockKey is the pg_advisory_lock key shared by migrations and the
+// seed, so two instances booting together run them one at a time.
+const migrationLockKey int64 = 0x74696c6c4d4947
+
+func unlock(conn *pgxpool.Conn) {
+	// A session lock must never go back to the pool still held.
+	if _, err := conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, migrationLockKey); err != nil {
+		_ = conn.Conn().Close(context.Background())
+	}
+}
+
+// WithAdvisoryLock runs fn while holding the migration advisory lock on a
+// dedicated connection. fn must not need that connection.
+func WithAdvisoryLock(ctx context.Context, pool *pgxpool.Pool, fn func(ctx context.Context) error) error {
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Release()
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, migrationLockKey); err != nil {
+		return fmt.Errorf("advisory lock: %w", err)
+	}
+	defer unlock(conn)
+	return fn(ctx)
+}
+
 func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
-	if _, err := pool.Exec(ctx, `
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Release()
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, migrationLockKey); err != nil {
+		return fmt.Errorf("advisory lock: %w", err)
+	}
+	defer unlock(conn)
+	if _, err := conn.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS schema_migrations (
 			filename TEXT PRIMARY KEY,
 			applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -32,7 +67,7 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 	sort.Strings(files)
 	for _, name := range files {
 		var exists bool
-		if err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE filename=$1)`, name).Scan(&exists); err != nil {
+		if err := conn.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE filename=$1)`, name).Scan(&exists); err != nil {
 			return err
 		}
 		if exists {
@@ -42,7 +77,7 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		if err != nil {
 			return err
 		}
-		tx, err := pool.Begin(ctx)
+		tx, err := conn.Begin(ctx)
 		if err != nil {
 			return err
 		}

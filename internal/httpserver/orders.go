@@ -55,6 +55,21 @@ func orderBody(o store.Order) map[string]any {
 	if o.PaidAt != nil {
 		body["paid_at"] = o.PaidAt
 	}
+	if o.RefundJournalID != nil {
+		body["refund_journal_id"] = o.RefundJournalID
+	}
+	if o.RefundedAt != nil {
+		body["refunded_at"] = o.RefundedAt
+	}
+	if o.RefundedBy != nil {
+		body["refunded_by"] = o.RefundedBy
+	}
+	if o.RefundReason != "" {
+		body["refund_reason"] = o.RefundReason
+	}
+	if o.RefundRecordID != nil {
+		body["refund_record_id"] = o.RefundRecordID
+	}
 	return body
 }
 
@@ -122,7 +137,7 @@ func (s *Server) createOrder(w http.ResponseWriter, r *http.Request) {
 		}
 		saleLines = append(saleLines, checkout.SaleLine{Product: p, Qty: ln.Qty})
 	}
-	hash := canonicalHash(raw)
+	hash := fingerprint(r, raw)
 	s.finishIdempotent(w, r, actor.MerchantID, key, hash, func(tx pgx.Tx) (int, []byte, *uuid.UUID, error) {
 		merchant, err := s.store.EnsureBooks(r.Context(), tx, actor.MerchantID)
 		if err != nil {
@@ -214,8 +229,16 @@ func (s *Server) refundOrder(w http.ResponseWriter, r *http.Request) {
 	if len(raw) == 0 {
 		raw = []byte(`{}`)
 	}
-	if err := decodeStrict(raw, &struct{}{}); err != nil {
+	var in struct {
+		Reason string `json:"reason"`
+	}
+	if err := decodeStrict(raw, &in); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_json", "invalid JSON")
+		return
+	}
+	reason := strings.TrimSpace(in.Reason)
+	if len(reason) > 200 {
+		writeError(w, http.StatusBadRequest, ledger.CodeInvalidOrder, "reason is too long")
 		return
 	}
 	actor := s.staff(r)
@@ -227,8 +250,8 @@ func (s *Server) refundOrder(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.authorizeOutlet(w, r, existing.OutletID); !ok {
 		return
 	}
-	s.finishIdempotent(w, r, actor.MerchantID, key, canonicalHash(raw), func(tx pgx.Tx) (int, []byte, *uuid.UUID, error) {
-		merchant, err := s.store.GetMerchant(r.Context(), tx, actor.MerchantID)
+	s.finishIdempotent(w, r, actor.MerchantID, key, fingerprint(r, raw), func(tx pgx.Tx) (int, []byte, *uuid.UUID, error) {
+		merchant, err := s.store.EnsureBooks(r.Context(), tx, actor.MerchantID)
 		if err != nil {
 			return 0, nil, nil, err
 		}
@@ -236,7 +259,7 @@ func (s *Server) refundOrder(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return 0, nil, nil, err
 		}
-		order, err = checkout.Refund(r.Context(), tx, s.store, merchant, order, actor.ID, key)
+		order, err = checkout.Refund(r.Context(), tx, s.store, merchant, order, actor.ID, key, reason)
 		if err != nil {
 			return 0, nil, nil, err
 		}
@@ -244,6 +267,6 @@ func (s *Server) refundOrder(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return 0, nil, nil, err
 		}
-		return http.StatusCreated, body, nil, nil
+		return http.StatusCreated, body, order.RefundJournalID, nil
 	})
 }

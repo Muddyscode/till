@@ -217,6 +217,10 @@ func (s *Server) listProducts(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) patchProduct(w http.ResponseWriter, r *http.Request) {
+	key, ok := requireIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
 	id, ok := s.parseID(w, r)
 	if !ok {
 		return
@@ -230,78 +234,75 @@ func (s *Server) patchProduct(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_json", "invalid JSON")
 		return
 	}
-	actor := s.staff(r)
-	p, err := s.store.GetProduct(r.Context(), s.store.Pool, actor.MerchantID, id)
-	if err != nil {
-		writeLedgerError(w, err)
-		return
-	}
-	oldPrice := p.PriceMinor
-	costSet := len(strings.TrimSpace(string(in.AvgCostMinor))) > 0 && strings.TrimSpace(string(in.AvgCostMinor)) != "null"
+	// Everything that does not need the product row is validated first.
+	var name *string
 	if in.Name != nil {
-		p.Name = strings.TrimSpace(*in.Name)
-		if p.Name == "" {
+		n := strings.TrimSpace(*in.Name)
+		if n == "" {
 			writeError(w, http.StatusBadRequest, "invalid_order", "name cannot be empty")
 			return
 		}
+		name = &n
 	}
+	var price *int64
 	if len(in.PriceMinor) > 0 {
-		price, err := money.ParseJSONAmount(in.PriceMinor)
-		if err != nil || price <= 0 {
+		v, err := money.ParseJSONAmount(in.PriceMinor)
+		if err != nil || v <= 0 {
 			writeError(w, http.StatusBadRequest, ledger.CodeInvalidAmount, "price_minor must be a positive integer")
 			return
 		}
-		p.PriceMinor = price
+		price = &v
 	}
-	if in.ReorderLevel != nil {
-		if *in.ReorderLevel < 0 {
-			writeError(w, http.StatusBadRequest, "invalid_order", "reorder_level cannot be negative")
-			return
-		}
-		p.ReorderLevel = *in.ReorderLevel
+	if in.ReorderLevel != nil && *in.ReorderLevel < 0 {
+		writeError(w, http.StatusBadRequest, "invalid_order", "reorder_level cannot be negative")
+		return
 	}
-	if in.Active != nil {
-		p.Active = *in.Active
-	}
-	if costSet {
-		avg, err := money.ParseOptionalKobo(in.AvgCostMinor)
+	var avg *int64
+	if c := strings.TrimSpace(string(in.AvgCostMinor)); c != "" && c != "null" {
+		v, err := money.ParseOptionalKobo(in.AvgCostMinor)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, ledger.CodeInvalidAmount, "avg_cost_minor must be a JSON integer in kobo")
 			return
 		}
-		p.AvgCostMinor = avg
-		var updated store.Product
-		err = s.withTx(r.Context(), func(tx pgx.Tx) error {
-			merchant, err := s.store.EnsureBooks(r.Context(), tx, actor.MerchantID)
-			if err != nil {
-				return err
-			}
-			updated, err = checkout.SaveProduct(r.Context(), tx, s.store, merchant, p, actor.ID)
-			return err
-		})
+		avg = &v
+	}
+	actor := s.staff(r)
+	s.finishIdempotent(w, r, actor.MerchantID, key, fingerprint(r, raw), func(tx pgx.Tx) (int, []byte, *uuid.UUID, error) {
+		merchant, err := s.store.EnsureBooks(r.Context(), tx, actor.MerchantID)
 		if err != nil {
-			writeLedgerError(w, err)
-			return
+			return 0, nil, nil, err
 		}
-		writeJSON(w, http.StatusOK, productBody(updated))
-		return
-	}
-	updated, err := s.store.UpdateProduct(r.Context(), s.store.Pool, p)
-	if err != nil {
-		writeLedgerError(w, err)
-		return
-	}
-	if updated.PriceMinor != oldPrice {
-		_ = s.withTx(r.Context(), func(tx pgx.Tx) error {
-			meta, _ := json.Marshal(map[string]any{"sku": updated.SKU, "from": oldPrice, "to": updated.PriceMinor})
-			mid, sid := actor.MerchantID, actor.ID
-			return s.store.InsertAudit(r.Context(), tx, store.AuditEvent{
-				MerchantID: &mid, StaffID: &sid, Action: "product.price_changed", EntityType: "product",
-				EntityID: updated.ID, Metadata: meta,
-			})
-		})
-	}
-	writeJSON(w, http.StatusOK, productBody(updated))
+		// The patch is applied to the row as locked here, never to a copy read
+		// before the transaction, so it cannot revert a concurrent receipt's cost.
+		p, err := s.store.LockProduct(r.Context(), tx, actor.MerchantID, id)
+		if err != nil {
+			return 0, nil, nil, err
+		}
+		if name != nil {
+			p.Name = *name
+		}
+		if price != nil {
+			p.PriceMinor = *price
+		}
+		if in.ReorderLevel != nil {
+			p.ReorderLevel = *in.ReorderLevel
+		}
+		if in.Active != nil {
+			p.Active = *in.Active
+		}
+		if avg != nil {
+			p.AvgCostMinor = *avg
+		}
+		updated, err := checkout.SaveProduct(r.Context(), tx, s.store, merchant, p, actor.ID)
+		if err != nil {
+			return 0, nil, nil, err
+		}
+		body, err := json.Marshal(productBody(updated))
+		if err != nil {
+			return 0, nil, nil, err
+		}
+		return http.StatusOK, body, nil, nil
+	})
 }
 
 func (s *Server) receiveStock(w http.ResponseWriter, r *http.Request) {
@@ -313,6 +314,10 @@ func (s *Server) adjustStock(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) stockMove(w http.ResponseWriter, r *http.Request, adjust bool) {
+	key, ok := requireIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
 	raw, ok := s.readBody(w, r)
 	if !ok {
 		return
@@ -363,33 +368,36 @@ func (s *Server) stockMove(w http.ResponseWriter, r *http.Request, adjust bool) 
 		}
 		unit = &n
 	}
-	var onHand int
-	var avg int64
-	err = s.withTx(r.Context(), func(tx pgx.Tx) error {
+	s.finishIdempotent(w, r, actor.MerchantID, key, fingerprint(r, raw), func(tx pgx.Tx) (int, []byte, *uuid.UUID, error) {
 		merchant, err := s.store.EnsureBooks(r.Context(), tx, actor.MerchantID)
 		if err != nil {
-			return err
+			return 0, nil, nil, err
 		}
+		body := map[string]any{"sku": product.SKU, "outlet_id": outlet.ID}
 		if adjust {
-			onHand, err = checkout.Adjust(r.Context(), tx, s.store, checkout.AdjustInput{
+			onHand, err := checkout.Adjust(r.Context(), tx, s.store, checkout.AdjustInput{
 				Merchant: merchant, Outlet: outlet, StaffID: actor.ID, ProductID: product.ID,
 				Delta: in.Delta, Reason: strings.TrimSpace(in.Reason),
 			})
-			return err
+			if err != nil {
+				return 0, nil, nil, err
+			}
+			body["on_hand"] = onHand
+		} else {
+			onHand, avg, err := checkout.Receive(r.Context(), tx, s.store, checkout.ReceiptInput{
+				Merchant: merchant, Outlet: outlet, StaffID: actor.ID, ProductID: product.ID,
+				Qty: in.Qty, UnitCost: unit,
+			})
+			if err != nil {
+				return 0, nil, nil, err
+			}
+			body["on_hand"] = onHand
+			body["avg_cost_minor"] = avg
 		}
-		onHand, avg, err = checkout.Receive(r.Context(), tx, s.store, checkout.ReceiptInput{
-			Merchant: merchant, Outlet: outlet, StaffID: actor.ID, ProductID: product.ID,
-			Qty: in.Qty, UnitCost: unit,
-		})
-		return err
+		raw, err := json.Marshal(body)
+		if err != nil {
+			return 0, nil, nil, err
+		}
+		return http.StatusOK, raw, nil, nil
 	})
-	if err != nil {
-		writeLedgerError(w, err)
-		return
-	}
-	body := map[string]any{"sku": product.SKU, "outlet_id": outlet.ID, "on_hand": onHand}
-	if !adjust {
-		body["avg_cost_minor"] = avg
-	}
-	writeJSON(w, http.StatusOK, body)
 }

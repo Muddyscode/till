@@ -67,6 +67,10 @@ func New(cfg config.Config, st *store.Store, log *slog.Logger) *Server {
 			r.Post("/v1/orders/{id}/refund", s.refundOrder)
 			r.Get("/v1/reports/daily-sales", s.dailySales)
 			r.Get("/v1/audit", s.listAudit)
+			r.Get("/v1/unmatched-payments", s.listUnmatched)
+			r.Post("/v1/unmatched-payments/{id}/apply", s.applyUnmatched)
+			r.Post("/v1/unmatched-payments/{id}/refund", s.refundUnmatched)
+			r.Post("/v1/unmatched-payments/{id}/refunded", s.settleUnmatched)
 		})
 
 		r.Group(func(r chi.Router) {
