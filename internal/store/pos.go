@@ -29,11 +29,16 @@ type Merchant struct {
 	SuspenseAccountID      *uuid.UUID
 	RefundsPayableID       *uuid.UUID
 	CreatedAt              time.Time
+	// Phase 3A settings.
+	VATRegistered         bool
+	MaxDiscountBpsCashier int
+	MaxDiscountBpsManager int
 }
 
 const merchantCols = `id, name, vat_inclusive_bps, clearing_account_id, vat_account_id, equity_account_id,
 	inventory_account_id, cogs_account_id, wallet_account_id, goods_received_account_id, adjustment_account_id,
-	suspense_account_id, refunds_payable_account_id, created_at`
+	suspense_account_id, refunds_payable_account_id, created_at,
+	vat_registered, max_discount_bps_cashier, max_discount_bps_manager`
 
 func scanMerchant(sc interface{ Scan(...any) error }) (Merchant, error) {
 	var m Merchant
@@ -41,6 +46,7 @@ func scanMerchant(sc interface{ Scan(...any) error }) (Merchant, error) {
 		&m.ID, &m.Name, &m.VATInclusiveBps, &m.ClearingAccountID, &m.VATAccountID, &m.EquityAccountID,
 		&m.InventoryAccountID, &m.COGSAccountID, &m.WalletAccountID, &m.GoodsReceivedAccountID, &m.AdjustmentAccountID,
 		&m.SuspenseAccountID, &m.RefundsPayableID, &m.CreatedAt,
+		&m.VATRegistered, &m.MaxDiscountBpsCashier, &m.MaxDiscountBpsManager,
 	)
 	return m, err
 }
@@ -74,9 +80,12 @@ type Product struct {
 	AvgCostMinor int64
 	ReorderLevel int
 	Active       bool
+	TaxClass     string // standard, exempt or zero
 	CreatedAt    time.Time
 }
 
+// OrderLine carries the line's share of the order discount, VAT and cost.
+// NetMinor + VATMinor + DiscountMinor = LineTotalMinor.
 type OrderLine struct {
 	ID             uuid.UUID
 	OrderID        uuid.UUID
@@ -85,6 +94,12 @@ type OrderLine struct {
 	Qty            int
 	UnitPriceMinor int64
 	LineTotalMinor int64
+	TaxClass       string
+	DiscountMinor  int64
+	VATMinor       int64
+	NetMinor       int64
+	CostMinor      int64
+	RefundedQty    int
 }
 
 type Order struct {
@@ -111,6 +126,9 @@ type Order struct {
 	RefundedAt      *time.Time
 	RefundedBy      *uuid.UUID
 	RefundReason    string
+	DiscountReason  string
+	RefundedMinor   int64
+	Payments        []Payment
 	// RefundRecordID is set by checkout.Refund for transfer sales (not stored on the order).
 	RefundRecordID *uuid.UUID
 	Lines          []OrderLine
@@ -133,23 +151,6 @@ type StockRow struct {
 	ReorderLevel int
 	PriceMinor   int64
 	AvgCostMinor int64
-}
-
-type MethodTotal struct {
-	Method     string
-	OrderCount int
-	TotalMinor int64
-	VATMinor   int64
-	NetMinor   int64
-}
-
-type DailySales struct {
-	OrderCount int
-	TotalMinor int64
-	VATMinor   int64
-	NetMinor   int64
-	BooksDebit int64
-	ByMethod   []MethodTotal
 }
 
 type AuditEvent struct {
@@ -461,20 +462,20 @@ func (s *Store) ListOutlets(ctx context.Context, db DBTX, merchantID, staffID uu
 
 func (s *Store) CreateProduct(ctx context.Context, db DBTX, p Product) (Product, error) {
 	err := db.QueryRow(ctx, `
-		INSERT INTO products (id, merchant_id, sku, name, price_minor, avg_cost_minor, reorder_level, active)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-		RETURNING id, merchant_id, sku, name, price_minor, avg_cost_minor, reorder_level, active, created_at
-	`, p.ID, p.MerchantID, p.SKU, p.Name, p.PriceMinor, p.AvgCostMinor, p.ReorderLevel, p.Active).Scan(
-		&p.ID, &p.MerchantID, &p.SKU, &p.Name, &p.PriceMinor, &p.AvgCostMinor, &p.ReorderLevel, &p.Active, &p.CreatedAt,
+		INSERT INTO products (id, merchant_id, sku, name, price_minor, avg_cost_minor, reorder_level, active, tax_class)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE(NULLIF($9, ''), 'standard'))
+		RETURNING `+productCols+`
+	`, p.ID, p.MerchantID, p.SKU, p.Name, p.PriceMinor, p.AvgCostMinor, p.ReorderLevel, p.Active, p.TaxClass).Scan(
+		&p.ID, &p.MerchantID, &p.SKU, &p.Name, &p.PriceMinor, &p.AvgCostMinor, &p.ReorderLevel, &p.Active, &p.TaxClass, &p.CreatedAt,
 	)
 	return p, err
 }
 
-const productCols = `id, merchant_id, sku, name, price_minor, avg_cost_minor, reorder_level, active, created_at`
+const productCols = `id, merchant_id, sku, name, price_minor, avg_cost_minor, reorder_level, active, tax_class, created_at`
 
 func scanProduct(sc interface{ Scan(...any) error }) (Product, error) {
 	var p Product
-	err := sc.Scan(&p.ID, &p.MerchantID, &p.SKU, &p.Name, &p.PriceMinor, &p.AvgCostMinor, &p.ReorderLevel, &p.Active, &p.CreatedAt)
+	err := sc.Scan(&p.ID, &p.MerchantID, &p.SKU, &p.Name, &p.PriceMinor, &p.AvgCostMinor, &p.ReorderLevel, &p.Active, &p.TaxClass, &p.CreatedAt)
 	return p, err
 }
 
@@ -525,10 +526,10 @@ func (s *Store) ListProducts(ctx context.Context, db DBTX, merchantID uuid.UUID)
 func (s *Store) UpdateProduct(ctx context.Context, db DBTX, p Product) (Product, error) {
 	row := db.QueryRow(ctx, `
 		UPDATE products
-		SET name = $3, price_minor = $4, avg_cost_minor = $5, reorder_level = $6, active = $7
+		SET name = $3, price_minor = $4, avg_cost_minor = $5, reorder_level = $6, active = $7, tax_class = $8
 		WHERE id = $1 AND merchant_id = $2
 		RETURNING `+productCols+`
-	`, p.ID, p.MerchantID, p.Name, p.PriceMinor, p.AvgCostMinor, p.ReorderLevel, p.Active)
+	`, p.ID, p.MerchantID, p.Name, p.PriceMinor, p.AvgCostMinor, p.ReorderLevel, p.Active, p.TaxClass)
 	out, err := scanProduct(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Product{}, ledger.Err(ledger.CodeNotFound, "product not found")
@@ -706,6 +707,7 @@ func scanOrder(sc interface{ Scan(...any) error }) (Order, error) {
 		&o.Reference, &o.IdempotencyKey, &o.JournalID,
 		&o.ExpiresAt, &o.PaidAt, &o.CreatedAt,
 		&o.RefundJournalID, &o.RefundedAt, &o.RefundedBy, &o.RefundReason,
+		&o.DiscountReason, &o.RefundedMinor,
 	)
 	return o, err
 }
@@ -714,26 +716,29 @@ const orderSelect = `id, merchant_id, outlet_id, staff_id, status, payment_metho
 	total_minor, vat_minor, net_minor, discount_minor, cost_minor, customer_id,
 	reference, COALESCE(idempotency_key, ''), journal_id,
 	expires_at, paid_at, created_at,
-	refund_journal_id, refunded_at, refunded_by, COALESCE(refund_reason, '')`
+	refund_journal_id, refunded_at, refunded_by, COALESCE(refund_reason, ''),
+	COALESCE(discount_reason, ''), refunded_minor`
 
 func (s *Store) InsertOrder(ctx context.Context, tx pgx.Tx, o Order) error {
 	_, err := tx.Exec(ctx, `
 		INSERT INTO orders (
 			id, merchant_id, outlet_id, staff_id, status, payment_method, currency,
 			total_minor, vat_minor, net_minor, discount_minor, cost_minor, customer_id,
-			reference, idempotency_key, journal_id, expires_at, paid_at, created_at
-		) VALUES ($1,$2,$3,$4,$5,$6,'NGN',$7,$8,$9,$10,$11,$12,$13,NULLIF($14,''),$15,$16,$17,$18)
+			reference, idempotency_key, journal_id, expires_at, paid_at, created_at, discount_reason
+		) VALUES ($1,$2,$3,$4,$5,$6,'NGN',$7,$8,$9,$10,$11,$12,$13,NULLIF($14,''),$15,$16,$17,$18,NULLIF($19,''))
 	`, o.ID, o.MerchantID, o.OutletID, o.StaffID, o.Status, o.PaymentMethod,
 		o.TotalMinor, o.VATMinor, o.NetMinor, o.DiscountMinor, o.CostMinor, o.CustomerID,
-		o.Reference, o.IdempotencyKey, o.JournalID, o.ExpiresAt, o.PaidAt, o.CreatedAt)
+		o.Reference, o.IdempotencyKey, o.JournalID, o.ExpiresAt, o.PaidAt, o.CreatedAt, o.DiscountReason)
 	return err
 }
 
 func (s *Store) InsertOrderLine(ctx context.Context, tx pgx.Tx, ln OrderLine) error {
 	_, err := tx.Exec(ctx, `
-		INSERT INTO order_lines (id, order_id, product_id, sku, qty, unit_price_minor, line_total_minor)
-		VALUES ($1,$2,$3,$4,$5,$6,$7)
-	`, ln.ID, ln.OrderID, ln.ProductID, ln.SKU, ln.Qty, ln.UnitPriceMinor, ln.LineTotalMinor)
+		INSERT INTO order_lines (id, order_id, product_id, sku, qty, unit_price_minor, line_total_minor,
+			tax_class, discount_minor, vat_minor, net_minor, cost_minor)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+	`, ln.ID, ln.OrderID, ln.ProductID, ln.SKU, ln.Qty, ln.UnitPriceMinor, ln.LineTotalMinor,
+		ln.TaxClass, ln.DiscountMinor, ln.VATMinor, ln.NetMinor, ln.CostMinor)
 	return err
 }
 
@@ -761,7 +766,8 @@ func (s *Store) loadLines(ctx context.Context, db DBTX, orders []Order) ([]Order
 		byID[o.ID] = i
 	}
 	rows, err := db.Query(ctx, `
-		SELECT id, order_id, product_id, sku, qty, unit_price_minor, line_total_minor
+		SELECT id, order_id, product_id, sku, qty, unit_price_minor, line_total_minor,
+			tax_class, discount_minor, vat_minor, net_minor, cost_minor, refunded_qty
 		FROM order_lines WHERE order_id = ANY($1) ORDER BY sku
 	`, ids)
 	if err != nil {
@@ -770,13 +776,18 @@ func (s *Store) loadLines(ctx context.Context, db DBTX, orders []Order) ([]Order
 	defer rows.Close()
 	for rows.Next() {
 		var ln OrderLine
-		if err := rows.Scan(&ln.ID, &ln.OrderID, &ln.ProductID, &ln.SKU, &ln.Qty, &ln.UnitPriceMinor, &ln.LineTotalMinor); err != nil {
+		if err := rows.Scan(&ln.ID, &ln.OrderID, &ln.ProductID, &ln.SKU, &ln.Qty, &ln.UnitPriceMinor, &ln.LineTotalMinor,
+			&ln.TaxClass, &ln.DiscountMinor, &ln.VATMinor, &ln.NetMinor, &ln.CostMinor, &ln.RefundedQty); err != nil {
 			return nil, err
 		}
 		i := byID[ln.OrderID]
 		orders[i].Lines = append(orders[i].Lines, ln)
 	}
-	return orders, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+	return s.loadPayments(ctx, db, orders)
 }
 
 func (s *Store) GetOrder(ctx context.Context, db DBTX, merchantID, orderID uuid.UUID) (Order, error) {
@@ -856,7 +867,8 @@ func (s *Store) ListOrders(ctx context.Context, db DBTX, merchantID uuid.UUID, o
 func (s *Store) MarkRefunded(ctx context.Context, tx pgx.Tx, orderID, journalID, staffID uuid.UUID, reason string, at time.Time) error {
 	tag, err := tx.Exec(ctx, `
 		UPDATE orders
-		SET status = 'refunded', refund_journal_id = $2, refunded_by = $3, refund_reason = NULLIF($4, ''), refunded_at = $5
+		SET status = 'refunded', refund_journal_id = $2, refunded_by = $3, refund_reason = NULLIF($4, ''), refunded_at = $5,
+		    refunded_minor = total_minor
 		WHERE id = $1 AND status = 'paid'
 	`, orderID, journalID, staffID, reason, at)
 	if err != nil {
@@ -1049,50 +1061,6 @@ func (s *Store) LockExpiredOrder(ctx context.Context, tx pgx.Tx, id uuid.UUID, n
 		return Order{}, false, nil
 	}
 	return o, err == nil, err
-}
-
-func (s *Store) DailySales(ctx context.Context, db DBTX, outletID uuid.UUID, day string) (DailySales, error) {
-	var ds DailySales
-	err := db.QueryRow(ctx, `
-		SELECT COUNT(*), COALESCE(SUM(total_minor),0), COALESCE(SUM(vat_minor),0), COALESCE(SUM(net_minor),0)
-		FROM orders
-		WHERE outlet_id = $1 AND status = 'paid'
-		  AND (paid_at AT TIME ZONE 'Africa/Lagos')::date = $2::date
-	`, outletID, day).Scan(&ds.OrderCount, &ds.TotalMinor, &ds.VATMinor, &ds.NetMinor)
-	if err != nil {
-		return DailySales{}, err
-	}
-	err = db.QueryRow(ctx, `
-		SELECT COALESCE(SUM(p.amount_minor),0)
-		FROM orders o
-		JOIN postings p ON p.journal_id = o.journal_id AND p.direction = 'debit'
-		JOIN accounts a ON a.id = p.account_id AND a.type IN ('asset', 'liability')
-		WHERE o.outlet_id = $1 AND o.status = 'paid'
-		  AND (o.paid_at AT TIME ZONE 'Africa/Lagos')::date = $2::date
-	`, outletID, day).Scan(&ds.BooksDebit)
-	if err != nil {
-		return DailySales{}, err
-	}
-	rows, err := db.Query(ctx, `
-		SELECT payment_method, COUNT(*), COALESCE(SUM(total_minor),0), COALESCE(SUM(vat_minor),0), COALESCE(SUM(net_minor),0)
-		FROM orders
-		WHERE outlet_id = $1 AND status = 'paid'
-		  AND (paid_at AT TIME ZONE 'Africa/Lagos')::date = $2::date
-		GROUP BY payment_method
-		ORDER BY payment_method
-	`, outletID, day)
-	if err != nil {
-		return DailySales{}, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var m MethodTotal
-		if err := rows.Scan(&m.Method, &m.OrderCount, &m.TotalMinor, &m.VATMinor, &m.NetMinor); err != nil {
-			return DailySales{}, err
-		}
-		ds.ByMethod = append(ds.ByMethod, m)
-	}
-	return ds, rows.Err()
 }
 
 func (s *Store) StockOnHand(ctx context.Context, db DBTX, outletID uuid.UUID, lowOnly bool) ([]StockRow, error) {

@@ -67,12 +67,27 @@ func (s *Server) dailySales(w http.ResponseWriter, r *http.Request) {
 			"total_minor": m.TotalMinor, "vat_minor": m.VATMinor, "net_minor": m.NetMinor,
 		})
 	}
+	cashiers := make([]map[string]any, 0, len(ds.ByCashier))
+	for _, c := range ds.ByCashier {
+		cashiers = append(cashiers, map[string]any{
+			"staff_id": c.StaffID, "email": c.Email, "order_count": c.OrderCount,
+			"total_minor": c.TotalMinor, "discount_minor": c.DiscountMinor,
+			"refund_count": c.RefundCount, "refunds_minor": c.RefundsMinor,
+		})
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"date": day, "outlet_id": outletID,
 		"order_count": ds.OrderCount, "total_minor": ds.TotalMinor,
 		"vat_minor": ds.VATMinor, "net_minor": ds.NetMinor,
-		"by_method": methods, "books_debit_minor": ds.BooksDebit,
-		"matches_books": ds.TotalMinor == ds.BooksDebit,
+		"discount_total_minor": ds.DiscountMinor,
+		"refund_count":         ds.RefundCount, "refunds_minor": ds.RefundsMinor,
+		"net_sales_minor": ds.TotalMinor - ds.RefundsMinor,
+		"tender_totals": map[string]any{
+			"cash_minor": ds.Tenders["cash"], "transfer_minor": ds.Tenders["transfer"], "wallet_minor": ds.Tenders["wallet"],
+		},
+		"by_method": methods, "by_cashier": cashiers,
+		"books_debit_minor": ds.BooksDebit, "books_refund_credit_minor": ds.BooksRefundCredit,
+		"matches_books": ds.TotalMinor == ds.BooksDebit && ds.RefundsMinor == ds.BooksRefundCredit,
 	})
 }
 

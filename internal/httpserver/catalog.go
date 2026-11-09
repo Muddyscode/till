@@ -29,6 +29,7 @@ type productReq struct {
 	PriceMinor   json.RawMessage `json:"price_minor"`
 	AvgCostMinor json.RawMessage `json:"avg_cost_minor"`
 	ReorderLevel *int            `json:"reorder_level"`
+	TaxClass     string          `json:"tax_class"`
 }
 
 type productPatch struct {
@@ -37,6 +38,7 @@ type productPatch struct {
 	AvgCostMinor json.RawMessage `json:"avg_cost_minor"`
 	ReorderLevel *int            `json:"reorder_level"`
 	Active       *bool           `json:"active"`
+	TaxClass     *string         `json:"tax_class"`
 }
 
 type stockReq struct {
@@ -60,7 +62,7 @@ func productBody(p store.Product) map[string]any {
 	return map[string]any{
 		"id": p.ID, "sku": p.SKU, "name": p.Name, "price_minor": p.PriceMinor,
 		"avg_cost_minor": p.AvgCostMinor,
-		"reorder_level":  p.ReorderLevel, "active": p.Active, "created_at": p.CreatedAt,
+		"reorder_level":  p.ReorderLevel, "active": p.Active, "tax_class": p.TaxClass, "created_at": p.CreatedAt,
 	}
 }
 
@@ -148,6 +150,16 @@ func (s *Server) listOutlets(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"outlets": out})
 }
 
+// parseTaxClass accepts "" (standard) or one of standard, exempt, zero.
+func parseTaxClass(raw string) (string, bool) {
+	c := strings.ToLower(strings.TrimSpace(raw))
+	switch c {
+	case "", "standard", "exempt", "zero":
+		return c, true
+	}
+	return "", false
+}
+
 func normalizeSKU(sku string) string {
 	return strings.ToUpper(strings.TrimSpace(sku))
 }
@@ -174,6 +186,11 @@ func (s *Server) createProduct(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, ledger.CodeInvalidAmount, "avg_cost_minor must be a JSON integer in kobo")
 		return
 	}
+	taxClass, ok := parseTaxClass(in.TaxClass)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid_order", "tax_class must be standard, exempt, or zero")
+		return
+	}
 	reorder := 0
 	if in.ReorderLevel != nil {
 		if *in.ReorderLevel < 0 {
@@ -189,7 +206,7 @@ func (s *Server) createProduct(w http.ResponseWriter, r *http.Request) {
 	}
 	actor := s.staff(r)
 	p, err := s.store.CreateProduct(r.Context(), s.store.Pool, store.Product{
-		ID: id, MerchantID: actor.MerchantID, SKU: sku, Name: name, PriceMinor: price, AvgCostMinor: avg, ReorderLevel: reorder, Active: true,
+		ID: id, MerchantID: actor.MerchantID, SKU: sku, Name: name, PriceMinor: price, AvgCostMinor: avg, ReorderLevel: reorder, Active: true, TaxClass: taxClass,
 	})
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -257,6 +274,15 @@ func (s *Server) patchProduct(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_order", "reorder_level cannot be negative")
 		return
 	}
+	var taxClass *string
+	if in.TaxClass != nil {
+		c, ok := parseTaxClass(*in.TaxClass)
+		if !ok || c == "" {
+			writeError(w, http.StatusBadRequest, "invalid_order", "tax_class must be standard, exempt, or zero")
+			return
+		}
+		taxClass = &c
+	}
 	var avg *int64
 	if c := strings.TrimSpace(string(in.AvgCostMinor)); c != "" && c != "null" {
 		v, err := money.ParseOptionalKobo(in.AvgCostMinor)
@@ -289,6 +315,9 @@ func (s *Server) patchProduct(w http.ResponseWriter, r *http.Request) {
 		}
 		if in.Active != nil {
 			p.Active = *in.Active
+		}
+		if taxClass != nil {
+			p.TaxClass = *taxClass
 		}
 		if avg != nil {
 			p.AvgCostMinor = *avg

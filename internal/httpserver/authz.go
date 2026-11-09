@@ -21,7 +21,7 @@ func (s *Server) adminPricing(next http.Handler) http.Handler {
 			return
 		}
 		deny := func() {
-			writeError(w, http.StatusForbidden, ledger.CodeForbidden, "only an admin can set price or cost")
+			writeError(w, http.StatusForbidden, ledger.CodeForbidden, "only an admin can set price, cost or tax class")
 		}
 		if r.Method == http.MethodPost {
 			deny()
@@ -41,7 +41,7 @@ func (s *Server) adminPricing(next http.Handler) http.Handler {
 		if json.Unmarshal(raw, &fields) == nil {
 			// encoding/json matches keys case-insensitively, so the guard must too.
 			for k := range fields {
-				if strings.EqualFold(k, "price_minor") || strings.EqualFold(k, "avg_cost_minor") {
+				if strings.EqualFold(k, "price_minor") || strings.EqualFold(k, "avg_cost_minor") || strings.EqualFold(k, "tax_class") {
 					deny()
 					return
 				}

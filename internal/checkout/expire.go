@@ -45,6 +45,9 @@ func releaseOne(ctx context.Context, tx pgx.Tx, st *store.Store, o store.Order) 
 	if err := st.SetReservationsStatus(ctx, tx, o.ID, "active", "released"); err != nil {
 		return err
 	}
+	if err := returnDeposits(ctx, tx, st, o); err != nil {
+		return err
+	}
 	if err := st.MarkExpired(ctx, tx, o.ID); err != nil {
 		return err
 	}

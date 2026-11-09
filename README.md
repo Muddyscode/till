@@ -58,9 +58,19 @@ The order is `paid`. The response is `201`. Audit action: `order.paid`.
 - `POST /v1/unmatched-payments/{id}/refund` moves it to `refund_pending`: Dr `2300` / Cr Refunds payable `2310`.
 - `POST /v1/unmatched-payments/{id}/refunded` records the payout: Dr `2310` / Cr `1100`.
 
+**Split tender.** `POST /v1/orders` takes either `payment_method` or `payments: [{method: cash|wallet|transfer, amount_minor, customer_id?}]` (at most one tender per method, `customer_id` only on the wallet tender, amounts must add up to the payable or `400 tender_mismatch`). One tender behaves like the matching `payment_method`; two or more make the order's `payment_method` `split`, and `payments` on the order shows each tender. Cash and wallet only: the sale posts at once, one journal debiting outlet cash and `2200`. With a transfer tender the order is held `pending_payment` and the stock reserved; the cash and wallet tenders are taken now and parked in **Deposits held `2400`** (Dr cash / Dr `2200`, Cr `2400`; the wallet balance drops at once). The Paystack webhook must be for the transfer portion only; it posts the sale as Dr `2400` + Dr `1100`, Cr sales, Cr VAT (+ Dr COGS, Cr inventory). On expiry or void the deposits go back (Dr `2400`, Cr outlet cash / Cr `2200`, wallet balance restored). A late transfer for an order whose deposits were already returned lands in unmatched payments, so the customer's transfer is refunded rather than silently applied (`apply` needs the full total, which a split order's transfer never is).
+
+**Void.** `POST /v1/orders/{id}/void` (Idempotency-Key; cashier at the outlet, manager, admin; optional `reason`) cancels a `pending_payment` order: reservation released, deposits returned, status `voided`, audit `order.voided`. A webhook that arrives afterwards is parked in unmatched payments with reason `order_voided`.
+
 **Refund.** A manager or admin restocks and reverses the sale journal in one transaction; an optional `reason` is stored with `refund_journal_id`, `refunded_at` and `refunded_by` on the order. Products are locked in id order before stock. That reversal puts the snapshotted cost back into inventory. It does not recompute the average, so a receipt that landed during the sale can leave quantity times average a few kobo away from the inventory account until the next receipt or a manual average change. If an account would go negative (for example the drawer was already banked) the answer is `409 refund_insufficient_funds` naming the account. A refunded **transfer** sale credits Refunds payable `2310` instead of clearing, because the money still has to leave through Paystack; the response carries `refund_record_id` and the same unmatched-payments record (`reason: order_refund`, `refund_pending`) is closed with `POST /v1/unmatched-payments/{id}/refunded`. `POST /v1/journals/{id}/reversal` refuses a journal that belongs to an order (`409 refund_via_order`). Refund the order so the shelf and the books move together.
 
-**Control accounts.** Free-form `POST /v1/journals`, `POST /v1/transfers` and raw reversals refuse any line on the merchant's system accounts (`1100`, `1200`, `2100`, `2150`, `2200`, `2300`, `2310`, `5000`) with `409 control_account`. They move only through sales, receipts, top-ups and the flows above. (Paying a supplier from cash against `2150` therefore needs its own flow; it is no longer a free-form transfer.)
+**Partial and per-line refunds.** `POST /v1/orders/{id}/refund` also takes `lines: [{product_id | sku, quantity}]`, `reason` and `refund_to` (`cash|wallet|transfer`). No `lines` means everything still unrefunded. Each line stores its own `discount_minor`, `vat_minor`, `net_minor` and `cost_minor` at sale time: the order discount is split by line total (floor per line, remainder kobo to the last line), then VAT is worked out per line on what the customer pays for it. A line's amounts are spread over its units as cumulative floors, so the last units carry the remainder and refunds in pieces add up to exactly what was sold. A refund can be repeated until nothing is left; status goes `paid`, `partially_refunded`, `refunded`, and `refunded_minor` keeps the running total. Each refund is its own journal (Dr sales, Dr VAT payable, Cr the tender accounts, plus Dr inventory / Cr COGS at the line's recorded cost), restocks the units and writes an `order_refunds` row; the response carries `refund` (id, amount, net, VAT, cost, lines, per-tender amounts, `journal_id`). Asking for more units than are left is `409 refund_exceeds_order`. A first refund of the whole of a single-tender order is still an exact reversal of the sale journal (the Phase 1 behaviour). **Which tender gets the money:** with `refund_to`, all of it, and that tender must still have that much left (`400` otherwise; a tender the order never used has nothing left). Without it, the refund is spread over the order's tenders in proportion to what each has left, so a single-tender order refunds to its own tender and a split order refunds pro rata (rounding kobo go to cash, then wallet, then transfer). The transfer share is credited to Refunds payable `2310` with its own `refund_pending` record, as above; the wallet share is returned to the customer's balance.
+
+**Discount controls.** `discount_reason` is required when `discount_minor > 0` (`400 discount_reason_required`) and is stored on the order. A cashier may discount up to `max_discount_bps_cashier` (default 1000, 10%) of the shelf total, a manager up to `max_discount_bps_manager` (default 3000); above that is `403 discount_limit`. An admin has no limit, but the discount must still be below the shelf total. `GET` and `PATCH /v1/merchant/settings` (admin) read and change `max_discount_bps_cashier`, `max_discount_bps_manager`, `vat_registered` and `vat_inclusive_bps`; changes are audited as `merchant.settings_updated` and apply to new orders only.
+
+**Tax classes.** Each product has `tax_class`: `standard` (default), `exempt` or `zero` (admin sets it on create or `PATCH`; a manager gets `403`). VAT is computed per line from the class: only `standard` lines carry VAT, at the merchant's `vat_inclusive_bps`. `vat_registered=false` (the small-business exemption) puts 0 VAT on every line whatever its class. The class is copied onto the order line. For a single standard-rated line the result is the same as the order-level formula below; multi-line orders can differ by a kobo or two because VAT is rounded per line.
+
+**Control accounts.** Free-form `POST /v1/journals`, `POST /v1/transfers` and raw reversals refuse any line on the merchant's system accounts (`1100`, `1200`, `2100`, `2150`, `2200`, `2300`, `2310`, `2400`, `5000`) with `409 control_account`. They move only through sales, receipts, top-ups and the flows above. (Paying a supplier from cash against `2150` therefore needs its own flow; it is no longer a free-form transfer.)
 
 **Expiry.** Every 30 seconds a sweeper finds due holds and releases each one in its own transaction (stock rows locked in product id order, deadlocks retried). Each release sets the order to `expired` and writes `reservation.released`; it posts no journal. A failing order is logged with `slog` and skipped for that tick so it cannot starve the others. The same loop deletes `idempotency_keys` older than 30 days (at most hourly).
 
@@ -68,9 +78,9 @@ The order is `paid`. The response is `201`. Audit action: `order.paid`.
 
 | Role | Can do |
 |---|---|
-| Cashier | Log in, see assigned outlets, sell, read stock, create a customer, take a cash top-up |
-| Manager | Cashier, plus non-price product edits, receipts, adjustments, refunds, daily sales, audit for their outlet |
-| Admin | Manager, plus creating products and price or cost changes, staff, API keys, outlets, the chart of accounts, and free-form journals |
+| Cashier | Log in, see assigned outlets, sell (discounts up to the cashier limit), void a pending order, read stock, create a customer, take a cash top-up |
+| Manager | Cashier, plus non-price product edits, receipts, adjustments, refunds, daily sales, audit for their outlet, a higher discount limit |
+| Admin | Manager, plus creating products and price, cost or tax class changes, staff, API keys, outlets, merchant settings, unlimited discounts, the chart of accounts, and free-form journals |
 
 An outlet id from another merchant is `404`. The same merchant, but a staff member who is not assigned to that outlet, is `403 outlet_forbidden`. Admins are not assigned outlet-by-outlet. They see the whole merchant. The last active admin cannot be disabled (`409 last_admin`).
 
@@ -98,7 +108,7 @@ An outlet id from another merchant is `404`. The same merchant, but a staff memb
 
 - Currency is NGN. Amounts are `BIGINT` kobo. `100` kobo is ₦1. JSON floats and scientific notation are `400`.
 - VAT is included in the price the customer pays. The merchant rate is `vat_inclusive_bps`. The seed uses `750`, which is 7.5%.
-- `vat = payable * bps / (10000 + bps)`, integer division. The leftover kobo stays in sales, so net plus VAT equals the payable. A ₦4,500.00 line (`450000` kobo) at 750 bps is VAT `31395` and net `418605`.
+- `vat = payable * bps / (10000 + bps)`, integer division, per line by tax class (see Tax classes). The leftover kobo stays in sales, so net plus VAT equals the payable. A ₦4,500.00 line (`450000` kobo) at 750 bps is VAT `31395` and net `418605`.
 - `discount_minor` is an optional order-level integer. Omit it, or send `0`, and nothing is taken off. It must be less than the shelf total. A ₦500.00 discount (`50000` kobo) on that ₦4,500.00 line makes the payable `400000`, VAT `27906`, and net `372094`. The cashier still cannot send a unit price. A discount does not reduce cost of goods.
 - Average cost is `avg_cost_minor` on the product. A receipt may send `unit_cost_minor`. The new average is `(units on hand * old average + quantity * unit cost) / (units on hand + quantity)`, rounded down. Omit the unit cost and the current average is kept. The first receipt that names a cost, when nothing is on hand, sets the average to that cost.
 - Available stock is `on_hand - reserved`. Low stock means available is less than or equal to `reorder_level`.
@@ -121,11 +131,16 @@ Webhook dedupe does not use this table; see `provider_events` under Webhook.
 
 ## Reports
 
-`matches_books` is true when the day's paid-order total equals the asset and liability debits on those sale journals. Cash and Paystack are asset debits. A wallet payment is a liability debit, so it still counts. Cost of goods is an expense debit and is left out, which is why a sale with a cost layer still matches. A refunded order is not in the total. Pending and expired orders are not in the total. Receipts and revaluations are not sale journals, so they are not in the figure either.
+`GET /v1/reports/daily-sales` (outlet and Lagos day) separates sales from refunds:
+
+- **Sales** (`order_count`, `total_minor`, `vat_minor`, `net_minor`, `discount_total_minor`) are orders paid on that Lagos day, whatever happened to them later. **A paid order that is refunded afterwards still counts as gross sales on its sale day.** (Before Phase 3A a refunded order dropped out of its day, which made yesterday's report change after the fact and hid the refund; now history is stable.) Pending, expired and voided orders are not sales.
+- **Refunds** (`refund_count`, `refunds_minor`) are refunds made on that day, counted on the refund day. `net_sales_minor = total_minor - refunds_minor` (both VAT inclusive; it can be negative on a day with more refunds than sales).
+- `tender_totals` (`cash_minor`, `transfer_minor`, `wallet_minor`) are the confirmed tenders of that day's sales, so a split order contributes to each of its tenders. `by_method` groups by the order's `payment_method` (including `split`). `by_cashier` gives each staff member's sales, discounts, and the refunds they made.
+- `books_debit_minor` is the asset and liability debits (outlet cash, Paystack clearing, wallet `2200`, suspense `2300`, Deposits held `2400`) on the sale journals of those orders; `books_refund_credit_minor` is the asset and liability credits (cash, wallet, Refunds payable `2310`) on that day's refund journals. **`matches_books` is true when `total_minor = books_debit_minor` and `refunds_minor = books_refund_credit_minor`.** Cost of goods, inventory, sales and VAT lines are not part of either figure, so a sale with a cost layer still matches. Receipts and revaluations are not sale journals.
 
 `GET /v1/reports/low-stock` and `GET /v1/reports/stock-on-hand` take `outlet_id`. Ikeja soap is seeded at 3 on hand with reorder level 5, so it is low. Surulere soap is 20 and is not.
 
-`GET /v1/invariants` is admin-only and returns `checks`, each with `name`, `holds`, `expected`, `actual`. `holds` is true when every check holds. Besides the identity below and the cached balances matching the journal, it checks that wallet `2200` equals the sum of customer balances, suspense `2300` equals the open unmatched payments, Refunds payable `2310` equals the refunds waiting for payout, and inventory `1200` is within one kobo per unit of the sum of `on_hand` times average cost (the check reports `residue_minor` and `tolerance_minor`, because average-cost rounding leaves a few kobo). The identity:
+`GET /v1/invariants` is admin-only and returns `checks`, each with `name`, `holds`, `expected`, `actual`. `holds` is true when every check holds. Besides the identity below and the cached balances matching the journal, it checks that wallet `2200` equals the sum of customer balances, suspense `2300` equals the open unmatched payments, Refunds payable `2310` equals the refunds waiting for payout, Deposits held `2400` equals the held cash and wallet tenders of pending split orders, and inventory `1200` is within one kobo per unit of the sum of `on_hand` times average cost (the check reports `residue_minor` and `tolerance_minor`, because average-cost rounding leaves a few kobo). The identity:
 
 ```text
 SUM(asset, expense) - SUM(liability, equity, income) = 0
@@ -157,6 +172,7 @@ Chart of accounts:
 | `2100` | VAT payable |
 | `2150` | Goods received. A receipt credits this. Paying the supplier later is an admin transfer: debit `2150`, credit cash |
 | `2200` | Customer wallet. Store credit. The sum of `customers.balance_minor` equals this account |
+| `2400` | Deposits held. Cash and wallet tenders of a split order still waiting for its transfer. Created on first use |
 | `3000` | Opening equity |
 | `5000` | Cost of goods sold |
 | `5200` | Inventory adjustment. Allowed to go negative, because raising an average cost credits this account |
@@ -264,6 +280,7 @@ The tests that protect the shop:
 - Audit records the actor. A refund restocks. A raw reversal of a sale journal is refused
 - Money safety (`tests/integration/money_safety_test.go`): idempotency keys are bound to method, path and body, webhook dedupe lives in `provider_events`, late or mismatched payments land in suspense and can be applied or refunded, control accounts refuse free-form postings, the database rejects unbalanced or late-added postings, and the sweeper skips a poison order
 - A stock adjustment cannot pass below reserved or below zero
+- Phase 3A (`tests/integration/sales_test.go`): split tender (cash + wallet at once; cash + transfer holds deposits until the transfer-only webhook), void and expiry return deposits, a late webhook for a voided order is unmatched, partial refunds add up exactly and restore the books, refund tender rule, discount limits by role and settings, tax classes and `vat_registered`, and the refund-day report. Every scenario ends with the invariants holding
 
 Ledger tests still reject unbalanced journals, JSON floats, and lost updates under concurrent transfers.
 
@@ -276,7 +293,7 @@ internal/checkout         cash sale, wallet, reserve, confirm, refund, receipts,
 internal/ledger           double-entry post, reversals, immutability
 internal/store            pgx and SQL
 internal/seed             Adaeze Studio
-migrations                0001 ledger, 0002 POS, 0003 wallet and cost, 0005 security
+migrations                0001 ledger, 0002 POS, 0003 wallet and cost, 0004 money safety, 0005 security, 0006 sales
 ```
 
 One stateless API process. One Postgres. Journals and postings are append-only: a trigger rejects updates and deletes. Reversals are new journals. Cached `balance_minor` moves in the same transaction as the postings. The journal is the source of truth.

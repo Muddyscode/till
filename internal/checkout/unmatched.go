@@ -127,6 +127,9 @@ func ApplyUnmatched(ctx context.Context, tx pgx.Tx, st *store.Store, merchant st
 	if err := st.SetOrderCost(ctx, tx, order.ID, cost); err != nil {
 		return store.Order{}, err
 	}
+	if err := st.SetLineCosts(ctx, tx, order.Lines); err != nil {
+		return store.Order{}, err
+	}
 	j, err := postSale(ctx, tx, st, SaleInput{Merchant: merchant, Outlet: outlet}, order, *merchant.SuspenseAccountID, "sys:unmatched-apply:"+u.ID.String())
 	if err != nil {
 		return store.Order{}, err

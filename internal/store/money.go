@@ -259,6 +259,19 @@ func (s *Store) Invariants(ctx context.Context, merchantID uuid.UUID) (Identity,
 		return Identity{}, nil, err
 	}
 	eq("refunds_payable_matches_pending_refunds", pending, refundsPayable)
+	deposits, err := bal("2400")
+	if err != nil {
+		return Identity{}, nil, err
+	}
+	var held int64
+	if err := tx.QueryRow(ctx, `
+		SELECT COALESCE(SUM(p.amount_minor), 0)
+		FROM payments p JOIN orders o ON o.id = p.order_id
+		WHERE o.merchant_id = $1 AND p.status = 'held'
+	`, merchantID).Scan(&held); err != nil {
+		return Identity{}, nil, err
+	}
+	eq("deposits_match_held_tenders", held, deposits)
 
 	var value, units int64
 	if err := tx.QueryRow(ctx, `

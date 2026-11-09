@@ -53,9 +53,9 @@ func statusFor(code string) int {
 	case ledger.CodeIdempotencyConflict, ledger.CodeIdempotencyInProgress, ledger.CodeAlreadyReversed, "already_closed",
 		ledger.CodeInsufficientStock, ledger.CodeInsufficientWallet, ledger.CodeRefundViaOrder, "last_admin", "email_taken", "code_taken", "sku_taken", "phone_taken",
 		ledger.CodeControlAccount, ledger.CodeRefundInsufficient, checkout.CodeUnmatchedNotApplicable,
-		"unmatched_not_open", "unmatched_not_refund_pending":
+		"unmatched_not_open", "unmatched_not_refund_pending", checkout.CodeRefundExceedsOrder:
 		return http.StatusConflict
-	case ledger.CodeForbidden, ledger.CodeOutletForbidden:
+	case ledger.CodeForbidden, ledger.CodeOutletForbidden, checkout.CodeDiscountLimit:
 		return http.StatusForbidden
 	default:
 		return http.StatusBadRequest

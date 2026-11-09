@@ -77,6 +77,7 @@ func New(cfg config.Config, st *store.Store, log *slog.Logger) *Server {
 		r.Get("/v1/orders", s.listOrdersPage)
 		r.Get("/v1/orders/{id}", s.getOrder)
 		r.Post("/v1/orders", s.createOrder)
+		r.Post("/v1/orders/{id}/void", s.voidOrder)
 		r.Get("/v1/reports/stock-on-hand", s.stockOnHand)
 		r.Get("/v1/reports/low-stock", s.lowStock)
 
@@ -105,6 +106,8 @@ func New(cfg config.Config, st *store.Store, log *slog.Logger) *Server {
 			r.Get("/v1/api-keys", s.listAPIKeys)
 			r.Delete("/v1/api-keys/{id}", s.revokeAPIKey)
 			r.Post("/v1/outlets", s.createOutlet)
+			r.Get("/v1/merchant/settings", s.getSettings)
+			r.Patch("/v1/merchant/settings", s.patchSettings)
 			r.Get("/v1/invariants", s.invariants)
 			r.Post("/v1/accounts", s.createAccount)
 			r.Get("/v1/accounts", s.listAccounts)

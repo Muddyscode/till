@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/Muddyscode/till/internal/ledger"
@@ -27,6 +28,9 @@ type SaleInput struct {
 	IdempotencyKey string
 	DiscountMinor  int64
 	CustomerID     *uuid.UUID
+	// Role is the actor's role ("admin", "manager", "cashier"); it picks the discount limit.
+	Role           string
+	DiscountReason string
 }
 
 func poster(st *store.Store) ledger.StorePoster {
@@ -40,52 +44,83 @@ func poster(st *store.Store) ledger.StorePoster {
 
 func newID() (uuid.UUID, error) { return uuid.NewV7() }
 
-func totals(lines []SaleLine, bps int, discount int64) (payable, vat, net int64, built []store.OrderLine, err error) {
+// calc is the priced basket: shelf total, payable after discount, VAT, net,
+// and the lines with their share of discount, VAT and net.
+type calc struct {
+	Shelf, Payable, VAT, Net int64
+	Lines                    []store.OrderLine
+}
+
+// totals prices the basket. The order discount is apportioned to lines by line
+// total (remainder kobo to the last line); each line's VAT is then computed on
+// what the customer pays for it, by tax class. Exempt and zero-rated lines, and
+// every line when the merchant is not VAT registered, carry no VAT.
+func totals(lines []SaleLine, bps int, vatRegistered bool, discount int64) (calc, error) {
 	if len(lines) == 0 {
-		return 0, 0, 0, nil, ledger.Err(ledger.CodeInvalidOrder, "order needs at least one line")
+		return calc{}, ledger.Err(ledger.CodeInvalidOrder, "order needs at least one line")
 	}
 	if discount < 0 {
-		return 0, 0, 0, nil, ledger.Err(ledger.CodeInvalidAmount, "discount_minor cannot be negative")
+		return calc{}, ledger.Err(ledger.CodeInvalidAmount, "discount_minor cannot be negative")
 	}
 	var shelf int64
+	var built []store.OrderLine
 	seen := map[uuid.UUID]struct{}{}
 	for _, ln := range lines {
 		if ln.Qty <= 0 {
-			return 0, 0, 0, nil, ledger.Err(ledger.CodeInvalidOrder, "qty must be > 0")
+			return calc{}, ledger.Err(ledger.CodeInvalidOrder, "qty must be > 0")
 		}
 		if !ln.Product.Active {
-			return 0, 0, 0, nil, ledger.Err(ledger.CodeInvalidOrder, ln.Product.SKU+" is not for sale")
+			return calc{}, ledger.Err(ledger.CodeInvalidOrder, ln.Product.SKU+" is not for sale")
 		}
 		if _, ok := seen[ln.Product.ID]; ok {
-			return 0, 0, 0, nil, ledger.Err(ledger.CodeInvalidOrder, "duplicate sku "+ln.Product.SKU)
+			return calc{}, ledger.Err(ledger.CodeInvalidOrder, "duplicate sku "+ln.Product.SKU)
 		}
 		seen[ln.Product.ID] = struct{}{}
 		if ln.Product.PriceMinor <= 0 || int64(ln.Qty) > math.MaxInt64/ln.Product.PriceMinor {
-			return 0, 0, 0, nil, ledger.Err(ledger.CodeInvalidAmount, "line total overflows")
+			return calc{}, ledger.Err(ledger.CodeInvalidAmount, "line total overflows")
 		}
 		lineTotal := int64(ln.Qty) * ln.Product.PriceMinor
 		if shelf > math.MaxInt64-lineTotal {
-			return 0, 0, 0, nil, ledger.Err(ledger.CodeInvalidAmount, "order total overflows")
+			return calc{}, ledger.Err(ledger.CodeInvalidAmount, "order total overflows")
 		}
 		shelf += lineTotal
 		id, err := newID()
 		if err != nil {
-			return 0, 0, 0, nil, err
+			return calc{}, err
+		}
+		class := ln.Product.TaxClass
+		if class == "" {
+			class = taxStandard
 		}
 		built = append(built, store.OrderLine{
 			ID: id, ProductID: ln.Product.ID, SKU: ln.Product.SKU,
-			Qty: ln.Qty, UnitPriceMinor: ln.Product.PriceMinor, LineTotalMinor: lineTotal,
+			Qty: ln.Qty, UnitPriceMinor: ln.Product.PriceMinor, LineTotalMinor: lineTotal, TaxClass: class,
 		})
 	}
 	if discount >= shelf {
-		return 0, 0, 0, nil, ledger.Err(ledger.CodeInvalidOrder, "discount must be less than the shelf total")
+		return calc{}, ledger.Err(ledger.CodeInvalidOrder, "discount must be less than the shelf total")
 	}
-	payable = shelf - discount
-	vat, net = InclusiveVAT(payable, bps)
-	if net <= 0 {
-		return 0, 0, 0, nil, ledger.Err(ledger.CodeInvalidAmount, "net sale is not positive")
+	weights := make([]int64, len(built))
+	for i, b := range built {
+		weights[i] = b.LineTotalMinor
 	}
-	return payable, vat, net, built, nil
+	shares := apportion(discount, weights, weights)
+	c := calc{Shelf: shelf, Payable: shelf - discount, Lines: built}
+	for i := range c.Lines {
+		ln := &c.Lines[i]
+		ln.DiscountMinor = shares[i]
+		pay := ln.LineTotalMinor - ln.DiscountMinor
+		if vatRegistered && ln.TaxClass == taxStandard {
+			ln.VATMinor, _ = InclusiveVAT(pay, bps)
+		}
+		ln.NetMinor = pay - ln.VATMinor
+		c.VAT += ln.VATMinor
+		c.Net += ln.NetMinor
+	}
+	if c.Net <= 0 {
+		return calc{}, ledger.Err(ledger.CodeInvalidAmount, "net sale is not positive")
+	}
+	return c, nil
 }
 
 // refreshProducts locks the sale's products in id order and swaps the pre-lock
@@ -132,13 +167,17 @@ func audit(ctx context.Context, tx pgx.Tx, st *store.Store, merchantID, staffID 
 }
 
 func postSale(ctx context.Context, tx pgx.Tx, st *store.Store, in SaleInput, order store.Order, debit uuid.UUID, key string) (ledger.Journal, error) {
+	return postSaleDebits(ctx, tx, st, in, order, []ledger.Line{{AccountID: debit, Direction: ledger.Debit, Amount: order.TotalMinor}}, key)
+}
+
+// postSaleDebits posts the sale. The debit lines (one account, or several for a
+// split tender) must add up to the order total.
+func postSaleDebits(ctx context.Context, tx pgx.Tx, st *store.Store, in SaleInput, order store.Order, debits []ledger.Line, key string) (ledger.Journal, error) {
 	if in.Merchant.VATAccountID == nil || in.Merchant.ClearingAccountID == nil {
 		return ledger.Journal{}, ledger.Err(ledger.CodeInvalidOrder, "merchant books are not set up")
 	}
-	lines := []ledger.Line{
-		{AccountID: debit, Direction: ledger.Debit, Amount: order.TotalMinor},
-		{AccountID: in.Outlet.SalesAccountID, Direction: ledger.Credit, Amount: order.NetMinor},
-	}
+	lines := append([]ledger.Line(nil), debits...)
+	lines = append(lines, ledger.Line{AccountID: in.Outlet.SalesAccountID, Direction: ledger.Credit, Amount: order.NetMinor})
 	if order.VATMinor > 0 {
 		lines = append(lines, ledger.Line{
 			AccountID: *in.Merchant.VATAccountID, Direction: ledger.Credit, Amount: order.VATMinor,
@@ -185,10 +224,14 @@ func payNow(ctx context.Context, tx pgx.Tx, st *store.Store, in SaleInput, metho
 	if err != nil {
 		return store.Order{}, err
 	}
-	payable, vat, net, lines, err := totals(in.Lines, in.Merchant.VATInclusiveBps, in.DiscountMinor)
+	c, err := totals(in.Lines, in.Merchant.VATInclusiveBps, in.Merchant.VATRegistered, in.DiscountMinor)
 	if err != nil {
 		return store.Order{}, err
 	}
+	if err := enforceDiscount(in.Merchant, in.Role, c.Shelf, in.DiscountMinor, in.DiscountReason); err != nil {
+		return store.Order{}, err
+	}
+	payable, vat, net, lines := c.Payable, c.VAT, c.Net, c.Lines
 	cost, err := st.LockSaleCost(ctx, tx, in.Merchant.ID, lines)
 	if err != nil {
 		return store.Order{}, err
@@ -214,7 +257,7 @@ func payNow(ctx context.Context, tx pgx.Tx, st *store.Store, in SaleInput, metho
 		ID: id, MerchantID: in.Merchant.ID, OutletID: in.Outlet.ID, StaffID: in.StaffID,
 		Status: "paid", PaymentMethod: method, Currency: "NGN",
 		TotalMinor: payable, VATMinor: vat, NetMinor: net,
-		DiscountMinor: in.DiscountMinor, CostMinor: cost, CustomerID: in.CustomerID,
+		DiscountMinor: in.DiscountMinor, DiscountReason: strings.TrimSpace(in.DiscountReason), CostMinor: cost, CustomerID: in.CustomerID,
 		Reference: ref, IdempotencyKey: in.IdempotencyKey, PaidAt: &paid, CreatedAt: in.Now,
 	}
 	if err := st.InsertOrder(ctx, tx, order); err != nil {
@@ -279,10 +322,14 @@ func ReserveTransfer(ctx context.Context, tx pgx.Tx, st *store.Store, in SaleInp
 	if err := lockProducts(ctx, tx, st, in.Outlet.ID, in.Lines); err != nil {
 		return store.Order{}, err
 	}
-	payable, vat, net, lines, err := totals(in.Lines, in.Merchant.VATInclusiveBps, in.DiscountMinor)
+	c, err := totals(in.Lines, in.Merchant.VATInclusiveBps, in.Merchant.VATRegistered, in.DiscountMinor)
 	if err != nil {
 		return store.Order{}, err
 	}
+	if err := enforceDiscount(in.Merchant, in.Role, c.Shelf, in.DiscountMinor, in.DiscountReason); err != nil {
+		return store.Order{}, err
+	}
+	payable, vat, net, lines := c.Payable, c.VAT, c.Net, c.Lines
 	ref, err := st.NextReference(ctx, tx, in.Outlet.ID, in.Outlet.Code)
 	if err != nil {
 		return store.Order{}, err
@@ -296,7 +343,8 @@ func ReserveTransfer(ctx context.Context, tx pgx.Tx, st *store.Store, in SaleInp
 		ID: id, MerchantID: in.Merchant.ID, OutletID: in.Outlet.ID, StaffID: in.StaffID,
 		Status: "pending_payment", PaymentMethod: "transfer", Currency: "NGN",
 		TotalMinor: payable, VATMinor: vat, NetMinor: net, DiscountMinor: in.DiscountMinor,
-		Reference: ref, IdempotencyKey: in.IdempotencyKey, ExpiresAt: &exp, CreatedAt: in.Now,
+		DiscountReason: strings.TrimSpace(in.DiscountReason),
+		Reference:      ref, IdempotencyKey: in.IdempotencyKey, ExpiresAt: &exp, CreatedAt: in.Now,
 	}
 	if err := st.InsertOrder(ctx, tx, order); err != nil {
 		return store.Order{}, err
@@ -373,9 +421,33 @@ func ConfirmTransfer(ctx context.Context, tx pgx.Tx, st *store.Store, in Confirm
 	if err := st.SetOrderCost(ctx, tx, in.Order.ID, cost); err != nil {
 		return store.Order{}, err
 	}
-	sale := SaleInput{Merchant: in.Merchant, Outlet: in.Outlet, Lines: lines}
-	j, err := postSale(ctx, tx, st, sale, in.Order, *in.Merchant.ClearingAccountID, in.IdempotencyKey)
+	if err := st.SetLineCosts(ctx, tx, in.Order.Lines); err != nil {
+		return store.Order{}, err
+	}
+	// A split order already holds its cash and wallet tenders in Deposits held
+	// (2400); the sale clears those and debits Paystack clearing for the rest.
+	held, err := st.HeldPayments(ctx, tx, in.Order.ID)
 	if err != nil {
+		return store.Order{}, err
+	}
+	var deposits int64
+	for _, h := range held {
+		deposits += h.AmountMinor
+	}
+	debits := []ledger.Line{{AccountID: *in.Merchant.ClearingAccountID, Direction: ledger.Debit, Amount: in.Order.TotalMinor - deposits}}
+	if deposits > 0 {
+		dep, err := st.EnsureDepositsAccount(ctx, tx, in.Merchant.ID)
+		if err != nil {
+			return store.Order{}, err
+		}
+		debits = append(debits, ledger.Line{AccountID: dep, Direction: ledger.Debit, Amount: deposits})
+	}
+	sale := SaleInput{Merchant: in.Merchant, Outlet: in.Outlet, Lines: lines}
+	j, err := postSaleDebits(ctx, tx, st, sale, in.Order, debits, in.IdempotencyKey)
+	if err != nil {
+		return store.Order{}, err
+	}
+	if err := st.ConfirmHeld(ctx, tx, in.Order.ID, j.ID); err != nil {
 		return store.Order{}, err
 	}
 	if err := st.AttachJournal(ctx, tx, in.Order.ID, j.ID, in.Now); err != nil {
@@ -386,6 +458,9 @@ func ConfirmTransfer(ctx context.Context, tx pgx.Tx, st *store.Store, in Confirm
 		eventID = &in.ProviderEventID
 	}
 	if err := st.ConfirmPayment(ctx, tx, in.Order.ID, j.ID, eventID); err != nil {
+		return store.Order{}, err
+	}
+	if in.Order.Payments, err = st.OrderPayments(ctx, tx, in.Order.ID); err != nil {
 		return store.Order{}, err
 	}
 	in.Order.Status = "paid"
@@ -484,6 +559,9 @@ func Refund(ctx context.Context, tx pgx.Tx, st *store.Store, merchant store.Merc
 	}
 	now := time.Now()
 	if err := st.MarkRefunded(ctx, tx, order.ID, j.ID, staffID, reason, now); err != nil {
+		return store.Order{}, err
+	}
+	if err := recordFullRefund(ctx, tx, st, order, j.ID, staffID, reason, now); err != nil {
 		return store.Order{}, err
 	}
 	if order.PaymentMethod == "wallet" {

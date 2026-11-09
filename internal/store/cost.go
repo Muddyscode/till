@@ -44,7 +44,7 @@ func (s *Store) SumOnHand(ctx context.Context, tx pgx.Tx, productID uuid.UUID) (
 	return n, err
 }
 
-// LockSaleCost locks the products in id order and returns qty * average cost.
+// LockSaleCost locks the products in id order and returns qty * average cost, and sets each line's CostMinor in place.
 func (s *Store) LockSaleCost(ctx context.Context, tx pgx.Tx, merchantID uuid.UUID, lines []OrderLine) (int64, error) {
 	ids := make([]uuid.UUID, 0, len(lines))
 	seen := map[uuid.UUID]struct{}{}
@@ -81,18 +81,20 @@ func (s *Store) LockSaleCost(ctx context.Context, tx pgx.Tx, merchantID uuid.UUI
 		return 0, err
 	}
 	var cost int64
-	for _, ln := range lines {
+	for i, ln := range lines {
 		avg, ok := costByID[ln.ProductID]
 		if !ok {
 			return 0, ledger.Err(ledger.CodeNotFound, "product not found")
 		}
+		lines[i].CostMinor = 0
 		if avg == 0 || ln.Qty == 0 {
 			continue
 		}
 		if int64(ln.Qty) > math.MaxInt64/avg || cost > math.MaxInt64-int64(ln.Qty)*avg {
 			return 0, ledger.Err(ledger.CodeInvalidAmount, "cost of goods overflows")
 		}
-		cost += int64(ln.Qty) * avg
+		lines[i].CostMinor = int64(ln.Qty) * avg
+		cost += lines[i].CostMinor
 	}
 	return cost, nil
 }

@@ -72,7 +72,7 @@ func TestDiscountChangesVATAndMatchesBooks(t *testing.T) {
 	h := http.Header{}
 	h.Set("Idempotency-Key", "disc-"+uuid.NewString())
 	sale := sh.admin.do(http.MethodPost, "/v1/orders", map[string]any{
-		"outlet_id": sh.ikeja, "payment_method": "cash", "discount_minor": 50_000,
+		"outlet_id": sh.ikeja, "payment_method": "cash", "discount_minor": 50_000, "discount_reason": "loyalty",
 		"lines": []map[string]any{{"sku": "SHEA", "qty": 1}},
 	}, h)
 	var cash map[string]any

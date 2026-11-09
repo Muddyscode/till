@@ -26,14 +26,26 @@ type orderReq struct {
 	Lines         []orderLineReq  `json:"lines"`
 	DiscountMinor json.RawMessage `json:"discount_minor"`
 	CustomerID    string          `json:"customer_id"`
+	// DiscountReason is required when discount_minor > 0.
+	DiscountReason string `json:"discount_reason"`
+	// Payments is split tender; use it instead of payment_method.
+	Payments []paymentReq `json:"payments"`
 }
 
 func orderBody(o store.Order) map[string]any {
 	lines := make([]map[string]any, 0, len(o.Lines))
 	for _, ln := range o.Lines {
 		lines = append(lines, map[string]any{
-			"sku": ln.SKU, "qty": ln.Qty,
+			"product_id": ln.ProductID, "sku": ln.SKU, "qty": ln.Qty,
 			"unit_price_minor": ln.UnitPriceMinor, "line_total_minor": ln.LineTotalMinor,
+			"tax_class": ln.TaxClass, "discount_minor": ln.DiscountMinor, "vat_minor": ln.VATMinor,
+			"net_minor": ln.NetMinor, "refunded_qty": ln.RefundedQty,
+		})
+	}
+	payments := make([]map[string]any, 0, len(o.Payments))
+	for _, p := range o.Payments {
+		payments = append(payments, map[string]any{
+			"method": p.Method, "status": p.Status, "amount_minor": p.AmountMinor, "refunded_minor": p.RefundedMinor,
 		})
 	}
 	body := map[string]any{
@@ -41,7 +53,11 @@ func orderBody(o store.Order) map[string]any {
 		"payment_method": o.PaymentMethod, "reference": o.Reference,
 		"total_minor": o.TotalMinor, "vat_minor": o.VATMinor, "net_minor": o.NetMinor,
 		"discount_minor": o.DiscountMinor, "cost_minor": o.CostMinor,
-		"currency": "NGN", "lines": lines, "created_at": o.CreatedAt,
+		"currency": "NGN", "lines": lines, "payments": payments, "created_at": o.CreatedAt,
+		"refunded_minor": o.RefundedMinor,
+	}
+	if o.DiscountReason != "" {
+		body["discount_reason"] = o.DiscountReason
 	}
 	if o.CustomerID != nil {
 		body["customer_id"] = o.CustomerID
@@ -88,7 +104,19 @@ func (s *Server) createOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	method := strings.ToLower(strings.TrimSpace(in.PaymentMethod))
-	if method != "cash" && method != "transfer" && method != "wallet" {
+	var tenders []checkout.Tender
+	split := len(in.Payments) > 0
+	if split {
+		if method != "" || strings.TrimSpace(in.CustomerID) != "" {
+			writeError(w, http.StatusBadRequest, ledger.CodeInvalidOrder, "use either payment_method or payments, not both; give customer_id inside the wallet payment")
+			return
+		}
+		var msg string
+		if tenders, msg = parseTenders(in.Payments); msg != "" {
+			writeError(w, http.StatusBadRequest, ledger.CodeInvalidOrder, msg)
+			return
+		}
+	} else if method != "cash" && method != "transfer" && method != "wallet" {
 		writeError(w, http.StatusBadRequest, ledger.CodeInvalidOrder, "payment_method must be cash, transfer, or wallet")
 		return
 	}
@@ -106,11 +134,11 @@ func (s *Server) createOrder(w http.ResponseWriter, r *http.Request) {
 		}
 		customerID = &id
 	}
-	if method == "wallet" && customerID == nil {
+	if !split && method == "wallet" && customerID == nil {
 		writeError(w, http.StatusBadRequest, ledger.CodeInvalidOrder, "wallet payment needs a customer_id")
 		return
 	}
-	if method != "wallet" && customerID != nil {
+	if !split && method != "wallet" && customerID != nil {
 		writeError(w, http.StatusBadRequest, ledger.CodeInvalidOrder, "customer_id is only used for wallet payments")
 		return
 	}
@@ -147,12 +175,15 @@ func (s *Server) createOrder(w http.ResponseWriter, r *http.Request) {
 			Merchant: merchant, Outlet: outlet, StaffID: actor.ID, Lines: saleLines,
 			Now: time.Now(), Hold: time.Duration(s.cfg.HoldMinutes) * time.Minute,
 			IdempotencyKey: key, DiscountMinor: discount, CustomerID: customerID,
+			Role: actor.Role, DiscountReason: in.DiscountReason,
 		}
 		var order store.Order
-		switch method {
-		case "cash":
+		switch {
+		case split:
+			order, err = checkout.SaleWithTenders(r.Context(), tx, s.store, inSale, tenders)
+		case method == "cash":
 			order, err = checkout.CashSale(r.Context(), tx, s.store, inSale)
-		case "wallet":
+		case method == "wallet":
 			order, err = checkout.WalletSale(r.Context(), tx, s.store, inSale)
 		default:
 			order, err = checkout.ReserveTransfer(r.Context(), tx, s.store, inSale)
@@ -213,6 +244,15 @@ func (s *Server) listOrders(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"orders": out})
 }
 
+type refundLineReq struct {
+	ProductID string `json:"product_id"`
+	SKU       string `json:"sku"`
+	Quantity  *int   `json:"quantity"`
+	Qty       *int   `json:"qty"`
+}
+
+// refundOrder takes back a whole order (no lines) or the listed lines, any
+// number of times until nothing is left. See checkout.RefundOrder.
 func (s *Server) refundOrder(w http.ResponseWriter, r *http.Request) {
 	key, ok := requireIdempotencyKey(w, r)
 	if !ok {
@@ -230,7 +270,9 @@ func (s *Server) refundOrder(w http.ResponseWriter, r *http.Request) {
 		raw = []byte(`{}`)
 	}
 	var in struct {
-		Reason string `json:"reason"`
+		Reason   string          `json:"reason"`
+		Lines    []refundLineReq `json:"lines"`
+		RefundTo string          `json:"refund_to"`
 	}
 	if err := decodeStrict(raw, &in); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_json", "invalid JSON")
@@ -240,6 +282,37 @@ func (s *Server) refundOrder(w http.ResponseWriter, r *http.Request) {
 	if len(reason) > 200 {
 		writeError(w, http.StatusBadRequest, ledger.CodeInvalidOrder, "reason is too long")
 		return
+	}
+	refundTo := strings.ToLower(strings.TrimSpace(in.RefundTo))
+	if refundTo != "" && refundTo != "cash" && refundTo != "wallet" && refundTo != "transfer" {
+		writeError(w, http.StatusBadRequest, ledger.CodeInvalidOrder, "refund_to must be cash, wallet, or transfer")
+		return
+	}
+	lines := make([]checkout.RefundLine, 0, len(in.Lines))
+	for _, l := range in.Lines {
+		rl := checkout.RefundLine{SKU: normalizeSKU(l.SKU)}
+		if (l.ProductID == "") == (rl.SKU == "") {
+			writeError(w, http.StatusBadRequest, ledger.CodeInvalidOrder, "each refund line needs exactly one of product_id or sku")
+			return
+		}
+		if l.ProductID != "" {
+			pid, err := uuid.Parse(strings.TrimSpace(l.ProductID))
+			if err != nil {
+				writeError(w, http.StatusBadRequest, ledger.CodeInvalidOrder, "product_id is invalid")
+				return
+			}
+			rl.ProductID = &pid
+		}
+		if (l.Quantity == nil) == (l.Qty == nil) {
+			writeError(w, http.StatusBadRequest, ledger.CodeInvalidOrder, "each refund line needs a quantity")
+			return
+		}
+		if l.Quantity != nil {
+			rl.Qty = *l.Quantity
+		} else {
+			rl.Qty = *l.Qty
+		}
+		lines = append(lines, rl)
 	}
 	actor := s.staff(r)
 	existing, err := s.store.GetOrder(r.Context(), s.store.Pool, actor.MerchantID, id)
@@ -259,14 +332,19 @@ func (s *Server) refundOrder(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return 0, nil, nil, err
 		}
-		order, err = checkout.Refund(r.Context(), tx, s.store, merchant, order, actor.ID, key, reason)
+		order, rf, err := checkout.RefundOrder(r.Context(), tx, s.store, checkout.RefundInput{
+			Merchant: merchant, Order: order, StaffID: actor.ID, IdemKey: key,
+			Reason: reason, Lines: lines, RefundTo: refundTo,
+		})
 		if err != nil {
 			return 0, nil, nil, err
 		}
-		body, err := json.Marshal(orderBody(order))
+		out := orderBody(order)
+		out["refund"] = refundBody(rf)
+		body, err := json.Marshal(out)
 		if err != nil {
 			return 0, nil, nil, err
 		}
-		return http.StatusCreated, body, order.RefundJournalID, nil
+		return http.StatusCreated, body, rf.JournalID, nil
 	})
 }

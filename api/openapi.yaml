@@ -22,6 +22,7 @@ tags:
   - name: Stock
   - name: Customers
   - name: Orders
+  - name: Merchant
   - name: Payments
   - name: Unmatched payments
   - name: Reports
@@ -492,11 +493,29 @@ paths:
           application/json:
             schema:
               type: object
-              required: [outlet_id, payment_method, lines]
+              required: [outlet_id, lines]
               additionalProperties: false
+              description: Give either payment_method or payments (split tender), not both.
               properties:
                 outlet_id: { type: string, format: uuid }
                 payment_method: { type: string, enum: [cash, transfer, wallet] }
+                payments:
+                  type: array
+                  minItems: 1
+                  maxItems: 3
+                  description: |
+                    Split tender, at most one tender per method, amounts adding up to the payable (else 400 tender_mismatch).
+                    Cash and wallet only posts at once. With a transfer tender the order is pending_payment, cash and wallet
+                    are held in Deposits held 2400, and the webhook must be for the transfer amount only.
+                  items:
+                    type: object
+                    required: [method, amount_minor]
+                    additionalProperties: false
+                    properties:
+                      method: { type: string, enum: [cash, wallet, transfer] }
+                      amount_minor: { type: integer, minimum: 1 }
+                      customer_id: { type: string, format: uuid, description: Required on the wallet tender only }
+                discount_reason: { type: string, maxLength: 200, description: Required when discount_minor > 0 (400 discount_reason_required). Over the role limit is 403 discount_limit. }
                 customer_id: { type: string, format: uuid, description: Required for wallet. Must be omitted for cash and transfer. }
                 discount_minor: { type: integer, minimum: 0, description: Order-level discount in kobo. Floats are rejected. }
                 lines:
@@ -560,8 +579,12 @@ paths:
   /v1/orders/{id}/refund:
     post:
       tags: [Orders]
-      summary: Refund a paid order
+      summary: Refund a paid order, in whole or by line
       description: |
+        Optional lines (product_id or sku, quantity) refund part of the order; no lines refunds everything left. Repeatable until
+        refunded: status goes paid, partially_refunded, refunded. Discount and VAT are apportioned to lines at sale time. More units
+        than are left is 409 refund_exceeds_order. refund_to (cash, wallet, transfer) sends all of it to one tender that still has
+        enough; without it the money goes back to the original tender, pro rata across a split order. The response adds refund.
         Admin or manager. Restocks and reverses the sale journal in one transaction. A wallet sale also puts the paid amount back on the customer balance. The average cost is not recomputed.
         Requires Idempotency-Key. Body may be empty, {} or an object with an optional reason.
         The order records refund_journal_id, refunded_at, refunded_by and refund_reason.
@@ -582,9 +605,19 @@ paths:
               additionalProperties: false
               properties:
                 reason: { type: string, maxLength: 200 }
+                refund_to: { type: string, enum: [cash, wallet, transfer] }
+                lines:
+                  type: array
+                  items:
+                    type: object
+                    additionalProperties: false
+                    properties:
+                      product_id: { type: string, format: uuid }
+                      sku: { type: string }
+                      quantity: { type: integer, minimum: 1 }
       responses:
         "201":
-          description: Order status is refunded
+          description: Order is partially_refunded or refunded; refund describes this refund
           headers:
             Idempotent-Replayed: { $ref: "#/components/headers/IdempotentReplayed" }
           content:
@@ -595,6 +628,75 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/orders/{id}/void:
+    post:
+      tags: [Orders]
+      summary: Void a pending order
+      description: |
+        Cashier at the outlet, manager or admin. Requires Idempotency-Key. Only a pending_payment order: the reservation is
+        released, held cash and wallet tenders are returned, status becomes voided and order.voided is audited.
+        A webhook arriving later goes to unmatched payments with reason order_voided.
+      operationId: voidOrder
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/id"
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                reason: { type: string, maxLength: 200 }
+      responses:
+        "200":
+          description: The voided order
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Order" }
+        "400":
+          $ref: "#/components/responses/Error"
+
+  /v1/merchant/settings:
+    get:
+      tags: [Merchant]
+      summary: Discount limits and VAT settings
+      description: Admin only.
+      operationId: getSettings
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: Settings
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MerchantSettings" }
+    patch:
+      tags: [Merchant]
+      summary: Change discount limits and VAT settings
+      description: Admin only. Applies to new orders. vat_registered false puts 0 VAT on every line.
+      operationId: patchSettings
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                vat_registered: { type: boolean }
+                vat_inclusive_bps: { type: integer, minimum: 0, maximum: 5000 }
+                max_discount_bps_cashier: { type: integer, minimum: 0, maximum: 10000 }
+                max_discount_bps_manager: { type: integer, minimum: 0, maximum: 10000 }
+      responses:
+        "200":
+          description: Updated settings
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MerchantSettings" }
 
   /v1/webhooks/paystack:
     post:
@@ -760,7 +862,12 @@ paths:
     get:
       tags: [Reports]
       summary: Paid sales for one Lagos calendar day
-      description: Admin or manager. outlet_id is required for every role. Omit date to use today in Africa/Lagos. Refunded, pending, and expired orders are excluded. matches_books compares the order total with the asset and liability debits on those sale journals. Cost of goods is an expense debit and is not included. A wallet payment is a liability debit and is included.
+      description: |
+        Admin or manager. outlet_id is required for every role. Omit date to use today in Africa/Lagos.
+        Sales count on the day they were paid, even if refunded later; pending, expired and voided orders are excluded.
+        Refunds count on the day they were made. net_sales_minor = total_minor - refunds_minor.
+        matches_books is true when total_minor equals the asset and liability debits on the sale journals (cash, clearing, wallet,
+        suspense, deposits held) and refunds_minor equals the asset and liability credits on that day's refund journals.
       operationId: dailySales
       security: [{ bearerAuth: [] }]
       parameters:
@@ -1470,6 +1577,7 @@ components:
         price_minor: { type: integer, description: Kobo }
         avg_cost_minor: { type: integer, description: Weighted average cost in kobo }
         reorder_level: { type: integer }
+        tax_class: { type: string, enum: [standard, exempt, zero], description: Admin only to set. Only standard lines carry VAT. }
         active: { type: boolean }
         created_at: { type: string, format: date-time }
 
@@ -1502,14 +1610,24 @@ components:
         qty: { type: integer }
         unit_price_minor: { type: integer }
         line_total_minor: { type: integer }
+        product_id: { type: string, format: uuid }
+        tax_class: { type: string, enum: [standard, exempt, zero] }
+        discount_minor: { type: integer, description: This line's share of the order discount }
+        vat_minor: { type: integer }
+        net_minor: { type: integer }
+        refunded_qty: { type: integer }
 
     Order:
       type: object
       properties:
         id: { type: string, format: uuid }
         outlet_id: { type: string, format: uuid }
-        status: { type: string, enum: [pending_payment, paid, expired, refunded] }
-        payment_method: { type: string, enum: [cash, transfer, wallet] }
+        status: { type: string, enum: [pending_payment, paid, expired, refunded, partially_refunded, voided] }
+        payment_method: { type: string, enum: [cash, transfer, wallet, split] }
+        payments: { type: array, items: { $ref: "#/components/schemas/Payment" } }
+        discount_reason: { type: string }
+        refunded_minor: { type: integer, description: Running total refunded }
+        refund: { $ref: "#/components/schemas/Refund" }
         customer_id: { type: string, format: uuid, description: Set only on a wallet sale }
         reference: { type: string, example: IKJ-A1B2C3D4-000001 }
         total_minor: { type: integer, description: Amount the customer pays, after discount }
@@ -1541,7 +1659,7 @@ components:
         event_id: { type: string, description: "Provider event id, or refund:{order id} for a refunded transfer sale" }
         amount_minor: { type: integer }
         currency: { type: string }
-        reason: { type: string, enum: [order_expired, order_already_paid, order_refunded, amount_mismatch, currency_mismatch, order_refund] }
+        reason: { type: string, enum: [order_expired, order_voided, order_already_paid, order_refunded, amount_mismatch, currency_mismatch, order_refund] }
         status: { type: string, enum: [open, applied, refund_pending, refunded] }
         created_at: { type: string, format: date-time }
         resolved_at: { type: string, format: date-time, nullable: true }
@@ -1569,8 +1687,63 @@ components:
               total_minor: { type: integer }
               vat_minor: { type: integer }
               net_minor: { type: integer }
+        discount_total_minor: { type: integer }
+        refund_count: { type: integer }
+        refunds_minor: { type: integer, description: Refunds made that day }
+        net_sales_minor: { type: integer, description: total_minor minus refunds_minor }
+        tender_totals:
+          type: object
+          properties:
+            cash_minor: { type: integer }
+            transfer_minor: { type: integer }
+            wallet_minor: { type: integer }
+        by_cashier:
+          type: array
+          items:
+            type: object
+            properties:
+              staff_id: { type: string, format: uuid }
+              email: { type: string }
+              order_count: { type: integer }
+              total_minor: { type: integer }
+              discount_minor: { type: integer }
+              refund_count: { type: integer }
+              refunds_minor: { type: integer }
         books_debit_minor: { type: integer }
+        books_refund_credit_minor: { type: integer }
         matches_books: { type: boolean }
+
+    MerchantSettings:
+      type: object
+      properties:
+        vat_registered: { type: boolean }
+        vat_inclusive_bps: { type: integer }
+        max_discount_bps_cashier: { type: integer, description: Default 1000 }
+        max_discount_bps_manager: { type: integer, description: Default 3000 }
+
+    Payment:
+      type: object
+      properties:
+        method: { type: string, enum: [cash, wallet, transfer] }
+        status: { type: string, enum: [pending, held, confirmed, returned] }
+        amount_minor: { type: integer }
+        refunded_minor: { type: integer }
+
+    Refund:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        order_id: { type: string, format: uuid }
+        journal_id: { type: string, format: uuid }
+        amount_minor: { type: integer }
+        net_minor: { type: integer }
+        vat_minor: { type: integer }
+        cost_minor: { type: integer }
+        lines: { type: array, items: { type: object, additionalProperties: true } }
+        tenders: { type: object, additionalProperties: { type: integer } }
+        reason: { type: string }
+        staff_id: { type: string, format: uuid }
+        created_at: { type: string, format: date-time }
 
     AuditEvent:
       type: object

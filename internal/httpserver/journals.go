@@ -221,6 +221,11 @@ func (s *Server) refuseControlAccounts(ctx context.Context, tx pgx.Tx, merchantI
 			control[*id] = code
 		}
 	}
+	if dep, ok, err := s.store.DepositsAccountID(ctx, tx, merchantID); err != nil {
+		return err
+	} else if ok {
+		control[dep] = "2400"
+	}
 	for _, l := range lines {
 		if code, ok := control[l.AccountID]; ok {
 			return ledger.Err(ledger.CodeControlAccount, "account "+code+" is a system control account and cannot be posted to directly")

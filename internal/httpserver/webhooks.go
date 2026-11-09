@@ -128,17 +128,28 @@ func (s *Server) paystackWebhook(w http.ResponseWriter, r *http.Request) {
 			body, _ := json.Marshal(map[string]string{"status": "ignored", "reason": "status_not_success"})
 			return finish(&mid, &oid, "ignored_status", http.StatusOK, body)
 		}
+		// A split order only expects its transfer portion from Paystack.
+		due := locked.TotalMinor
+		if locked.Status == "pending_payment" {
+			if n, ok, err := s.store.PendingTransferMinor(r.Context(), tx, locked.ID); err != nil {
+				return err
+			} else if ok {
+				due = n
+			}
+		}
 		reason := ""
 		switch {
 		case locked.Status == "expired":
 			reason = "order_expired"
-		case locked.Status == "paid":
+		case locked.Status == "voided":
+			reason = "order_voided"
+		case locked.Status == "paid" || locked.Status == "partially_refunded":
 			reason = "order_already_paid"
 		case locked.Status == "refunded":
 			reason = "order_refunded"
 		case currency != "NGN":
 			reason = "currency_mismatch"
-		case amount != locked.TotalMinor:
+		case amount != due:
 			reason = "amount_mismatch"
 		}
 		merchant, err := s.store.EnsureBooks(r.Context(), tx, locked.MerchantID)
