@@ -146,6 +146,17 @@ Webhook dedupe does not use this table; see `provider_events` under Webhook.
 SUM(asset, expense) - SUM(liability, equity, income) = 0
 ```
 
+## Shop operations (Phase 3B)
+
+Migration `0007_operations.sql`. All of it is derived from, or sits beside, the existing sale code.
+
+- **Shifts and cash-up.** `POST /v1/shifts/open`, `GET /v1/shifts`, `GET /v1/shifts/{id}`, `GET /v1/shifts/{id}/z-report`, `POST /v1/shifts/{id}/close`. One open shift per staff member per outlet (`409 shift_already_open`). Expected cash is the opening float plus debits minus credits to the outlet cash account `1000-CODE` between open and close, for journals that staff member posted. Journals carry no actor, so each is matched to its staff member through the audit event written in the same transaction (same `created_at`). A count that differs posts the variance against account `5300` "Cash over/short" (created on first use). The Z-report is returned by close and frozen. A manager or admin may close anyone's shift. Not built: a `require_open_shift` merchant setting; enforcing it needs a hook in the sale path.
+- **Event feed and webhooks.** `GET /v1/events?cursor=&types=` (admin) lists public events derived from `audit_events`. `POST/GET/DELETE /v1/webhook-endpoints` and `GET /v1/webhook-endpoints/{id}/deliveries` manage endpoints; the signing secret is shown once. The worker in `cmd/tilld` fans new events out and POSTs them with `Till-Signature: t=<unix>,v1=<hex HMAC-SHA256 of "t.body">` and `Till-Event-Id`, retrying with exponential backoff up to 8 attempts, 10 s timeout, redirects never followed, private and link-local targets blocked in production. Several instances are safe (cursor row lock, `SKIP LOCKED`). `stock.low` is computed by the worker, so it is webhook-only. Delivery is at-least-once; dedupe on `Till-Event-Id`. The worker holds back events younger than 1 s so a slow commit is not skipped by the cursor.
+- **Stock transfers.** `POST /v1/stock/transfers` deducts from the source (never below reserved) and sets `in_transit`; `.../receive` adds to the destination; `.../cancel` returns to the source. No journal: inventory `1200` is merchant-wide and cost is per product. `/v1/invariants` counts units in transit at average cost.
+- **Stock counts.** `POST /v1/stock/counts` sets `on_hand` to the counted figure, posting any variance through the normal adjustment path (`5200`, reason `stock_count`). Counting below reserved is `409`.
+- **Suppliers.** CRUD on `/v1/suppliers`; a stock receipt may carry `supplier_id`. `POST /v1/supplier-payments` posts Dr `2150` / Cr outlet cash (`cash`) or Cr `1100` (`bank`). `GET /v1/suppliers/{id}/statement` shows receipts, payments and the balance owed.
+- **VAT summary.** `GET /v1/reports/vat?from=&to=` (admin): output VAT (credits to `2100`) and reversals by Lagos month. Input VAT is a placeholder `0`.
+
 ## Seeded shop
 
 Adaeze Studio sells skincare. Outlets are Ikeja `IKJ` and Surulere `SUL`.

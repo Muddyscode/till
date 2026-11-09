@@ -80,6 +80,7 @@ func New(cfg config.Config, st *store.Store, log *slog.Logger) *Server {
 		r.Post("/v1/orders/{id}/void", s.voidOrder)
 		r.Get("/v1/reports/stock-on-hand", s.stockOnHand)
 		r.Get("/v1/reports/low-stock", s.lowStock)
+		s.registerOperations(r)
 
 		r.Group(func(r chi.Router) {
 			r.Use(s.requireRole(auth.RoleAdmin, auth.RoleManager))

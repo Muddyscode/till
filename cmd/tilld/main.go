@@ -12,6 +12,7 @@ import (
 
 	"github.com/Muddyscode/till/internal/checkout"
 	"github.com/Muddyscode/till/internal/config"
+	"github.com/Muddyscode/till/internal/events"
 	"github.com/Muddyscode/till/internal/httpserver"
 	"github.com/Muddyscode/till/internal/seed"
 	"github.com/Muddyscode/till/internal/store"
@@ -60,6 +61,13 @@ func main() {
 		checkout.RunSweeper(ctx, st, sweepEvery, log, api.SweeperBeat)
 	}()
 
+	var hooks sync.WaitGroup
+	hooks.Add(1)
+	go func() {
+		defer hooks.Done()
+		(&events.Worker{Store: st, Log: log, Client: events.NewClient(cfg.Env == config.EnvProduction), Lag: time.Second}).Run(ctx)
+	}()
+
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           httpserver.Handler(api),
@@ -89,7 +97,7 @@ func main() {
 	}
 	cancel()
 	done := make(chan struct{})
-	go func() { sweeper.Wait(); close(done) }()
+	go func() { sweeper.Wait(); hooks.Wait(); close(done) }()
 	select {
 	case <-done:
 	case <-shutdownCtx.Done():
