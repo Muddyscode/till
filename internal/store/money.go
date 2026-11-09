@@ -268,6 +268,17 @@ func (s *Store) Invariants(ctx context.Context, merchantID uuid.UUID) (Identity,
 	`, merchantID).Scan(&value, &units); err != nil {
 		return Identity{}, nil, err
 	}
+	// Units sent between outlets and not yet received are off the shelves but still inventory.
+	transitValue, err := s.InTransitValue(ctx, tx, merchantID)
+	if err != nil {
+		return Identity{}, nil, err
+	}
+	transitUnits, err := s.InTransitUnits(ctx, tx, merchantID)
+	if err != nil {
+		return Identity{}, nil, err
+	}
+	value += transitValue
+	units += transitUnits
 	inv, err := bal("1200")
 	if err != nil {
 		return Identity{}, nil, err

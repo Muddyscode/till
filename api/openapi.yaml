@@ -30,6 +30,9 @@ tags:
   - name: ApiKeys
   - name: Ops
   - name: Ledger
+  - name: Shifts
+  - name: Events
+  - name: Suppliers
 
 paths:
   /v1/health:
@@ -1357,6 +1360,579 @@ paths:
         "404":
           $ref: "#/components/responses/Error"
 
+  # ---- Phase 3B: shop operations ----
+  /v1/shifts/open:
+    post:
+      tags: [Shifts]
+      summary: Open a till shift
+      description: One open shift per staff member per outlet (409 shift_already_open).
+      operationId: openShift
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [outlet_id]
+              additionalProperties: false
+              properties:
+                outlet_id: { type: string, format: uuid }
+                opening_float_minor: { type: integer, minimum: 0, default: 0 }
+      responses:
+        "201":
+          description: The open shift
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Shift" }
+        "409":
+          $ref: "#/components/responses/Error"
+
+  /v1/shifts:
+    get:
+      tags: [Shifts]
+      summary: List shifts
+      description: Cashiers see their own; managers and admins see the outlet. Non-admins must pass outlet_id.
+      operationId: listShifts
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/outletId"
+        - $ref: "#/components/parameters/limit"
+        - { in: query, name: status, schema: { type: string, enum: [open, closed] } }
+      responses:
+        "200":
+          description: Shifts, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  shifts:
+                    type: array
+                    items: { $ref: "#/components/schemas/Shift" }
+
+  /v1/shifts/{id}:
+    get:
+      tags: [Shifts]
+      summary: One shift
+      operationId: getShift
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/id"
+      responses:
+        "200":
+          description: The shift
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Shift" }
+        "404":
+          $ref: "#/components/responses/Error"
+
+  /v1/shifts/{id}/z-report:
+    get:
+      tags: [Shifts]
+      summary: Z-report (live for an open shift, frozen once closed)
+      description: |
+        Expected cash = opening float + debits - credits to the outlet cash account (1000-CODE)
+        from journals this staff member posted between open and close. Journals carry no actor, so
+        they are matched to the staff member by the audit event written in the same transaction.
+      operationId: shiftZReport
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/id"
+      responses:
+        "200":
+          description: The report
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ZReport" }
+
+  /v1/shifts/{id}/close:
+    post:
+      tags: [Shifts]
+      summary: Count the drawer and close the shift
+      description: |
+        The owner, or any manager/admin of the outlet. Variance = counted - expected. A non-zero
+        variance posts cash against account 5300 "Cash over/short" (short: Dr 5300 / Cr cash;
+        over: Dr cash / Cr 5300). A second close is 409 already_closed.
+      operationId: closeShift
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/id"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [counted_cash_minor]
+              additionalProperties: false
+              properties:
+                counted_cash_minor: { type: integer, minimum: 0 }
+                note: { type: string, maxLength: 500 }
+      responses:
+        "200":
+          description: The closed shift with its z_report
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Shift" }
+        "409":
+          $ref: "#/components/responses/Error"
+
+  /v1/events:
+    get:
+      tags: [Events]
+      summary: Public event feed
+      description: |
+        Admin only. Events derived from the audit log, oldest first, polled with next_cursor
+        (an empty page echoes the cursor you sent). Types: order.paid, order.refunded, order.voided,
+        order.expired, payment.unmatched, stock.received, stock.adjusted, stock.counted, shift.opened,
+        shift.closed, transfer.sent, transfer.received, transfer.cancelled, supplier.payment.
+        stock.low is computed by the webhook worker and is not in this feed.
+      operationId: listEvents
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/cursor"
+        - { in: query, name: types, description: Comma-separated event types, schema: { type: string } }
+        - { in: query, name: limit, schema: { type: integer, minimum: 1, maximum: 500, default: 100 } }
+      responses:
+        "200":
+          description: Events
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  events:
+                    type: array
+                    items: { $ref: "#/components/schemas/Event" }
+                  next_cursor: { $ref: "#/components/schemas/NextCursor" }
+
+  /v1/webhook-endpoints:
+    post:
+      tags: [Events]
+      summary: Register a webhook endpoint
+      description: |
+        Admin only. https only (http://localhost and 127.0.0.1 are allowed outside production);
+        private and link-local targets are blocked in production. The signing secret is returned
+        once. Each delivery is a POST with Till-Signature "t=<unix>,v1=<hex HMAC-SHA256 of t.body>"
+        and Till-Event-Id; non-2xx or errors are retried with exponential backoff up to 8 attempts.
+        Redirects are never followed. Empty event_types means every type (including stock.low).
+      operationId: createWebhookEndpoint
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              additionalProperties: false
+              properties:
+                url: { type: string }
+                event_types: { type: array, items: { type: string } }
+      responses:
+        "201":
+          description: The endpoint, with its secret
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WebhookEndpoint" }
+    get:
+      tags: [Events]
+      summary: List webhook endpoints
+      operationId: listWebhookEndpoints
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: Endpoints (no secrets)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  webhook_endpoints:
+                    type: array
+                    items: { $ref: "#/components/schemas/WebhookEndpoint" }
+
+  /v1/webhook-endpoints/{id}:
+    delete:
+      tags: [Events]
+      summary: Delete a webhook endpoint
+      operationId: deleteWebhookEndpoint
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/id"
+      responses:
+        "204":
+          description: Deleted; pending deliveries are dropped
+
+  /v1/webhook-endpoints/{id}/deliveries:
+    get:
+      tags: [Events]
+      summary: Delivery attempts for an endpoint
+      operationId: listWebhookDeliveries
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/id"
+        - $ref: "#/components/parameters/limit"
+      responses:
+        "200":
+          description: Deliveries, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deliveries:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string, format: uuid }
+                        event_id: { type: string, format: uuid }
+                        event_type: { type: string }
+                        status: { type: string, enum: [pending, delivered, failed] }
+                        attempts: { type: integer }
+                        next_attempt_at: { type: string, format: date-time }
+                        last_status: { type: integer, nullable: true }
+                        last_error: { type: string, nullable: true }
+                        delivered_at: { type: string, format: date-time, nullable: true }
+
+  /v1/stock/transfers:
+    post:
+      tags: [Stock]
+      summary: Send stock to another outlet
+      description: |
+        Manager of the source outlet or admin. Deducts from the source (never below reserved) and
+        records the transfer as in_transit. No journal is posted: inventory (1200) is merchant-wide
+        and average cost is per product. /v1/invariants counts units in transit at average cost.
+      operationId: createTransfer
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [from_outlet_id, to_outlet_id, lines]
+              additionalProperties: false
+              properties:
+                from_outlet_id: { type: string, format: uuid }
+                to_outlet_id: { type: string, format: uuid }
+                note: { type: string }
+                lines:
+                  type: array
+                  items:
+                    type: object
+                    required: [sku, quantity]
+                    properties:
+                      sku: { type: string }
+                      quantity: { type: integer, minimum: 1 }
+      responses:
+        "201":
+          description: The in-transit transfer
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StockTransfer" }
+        "409":
+          $ref: "#/components/responses/Error"
+    get:
+      tags: [Stock]
+      summary: List transfers
+      operationId: listTransfers
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { in: query, name: status, schema: { type: string, enum: [in_transit, received, cancelled] } }
+        - $ref: "#/components/parameters/limit"
+      responses:
+        "200":
+          description: Transfers, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  transfers:
+                    type: array
+                    items: { $ref: "#/components/schemas/StockTransfer" }
+
+  /v1/stock/transfers/{id}:
+    get:
+      tags: [Stock]
+      summary: One transfer
+      operationId: getTransfer
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/id"
+      responses:
+        "200":
+          description: The transfer
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StockTransfer" }
+
+  /v1/stock/transfers/{id}/receive:
+    post:
+      tags: [Stock]
+      summary: Receive a transfer at the destination
+      description: Manager of the destination outlet or admin. 409 transfer_not_in_transit if already settled.
+      operationId: receiveTransfer
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/id"
+      responses:
+        "200":
+          description: The received transfer
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StockTransfer" }
+
+  /v1/stock/transfers/{id}/cancel:
+    post:
+      tags: [Stock]
+      summary: Cancel an in-transit transfer
+      description: Manager of the source outlet or admin. Returns the units to the source.
+      operationId: cancelTransfer
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/id"
+      responses:
+        "200":
+          description: The cancelled transfer
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StockTransfer" }
+
+  /v1/stock/counts:
+    post:
+      tags: [Stock]
+      summary: Record a stock count
+      description: |
+        Manager or admin. Per line, variance = counted - on_hand. A non-zero variance is posted
+        through the adjustment path (Dr/Cr inventory 1200 against 5200 at average cost, reason
+        stock_count) and on_hand becomes the counted figure. Counting below reserved is 409
+        insufficient_stock and the whole count is rolled back.
+      operationId: createStockCount
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [outlet_id, lines]
+              additionalProperties: false
+              properties:
+                outlet_id: { type: string, format: uuid }
+                note: { type: string }
+                lines:
+                  type: array
+                  items:
+                    type: object
+                    required: [sku, counted]
+                    properties:
+                      sku: { type: string }
+                      counted: { type: integer, minimum: 0 }
+      responses:
+        "201":
+          description: The count with per-line variances
+          content:
+            application/json:
+              schema: { type: object }
+
+  /v1/stock/counts/{id}:
+    get:
+      tags: [Stock]
+      summary: One stock count
+      operationId: getStockCount
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/id"
+      responses:
+        "200":
+          description: The count
+          content:
+            application/json:
+              schema: { type: object }
+
+  /v1/suppliers:
+    post:
+      tags: [Suppliers]
+      summary: Create a supplier
+      description: Manager or admin. A stock receipt may carry supplier_id to link it to a supplier.
+      operationId: createSupplier
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              additionalProperties: false
+              properties:
+                name: { type: string }
+                phone: { type: string }
+                note: { type: string }
+      responses:
+        "201":
+          description: The supplier
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Supplier" }
+    get:
+      tags: [Suppliers]
+      summary: List suppliers
+      operationId: listSuppliers
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: Suppliers
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  suppliers:
+                    type: array
+                    items: { $ref: "#/components/schemas/Supplier" }
+
+  /v1/suppliers/{id}:
+    get:
+      tags: [Suppliers]
+      summary: One supplier
+      operationId: getSupplier
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/id"
+      responses:
+        "200":
+          description: The supplier
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Supplier" }
+    patch:
+      tags: [Suppliers]
+      summary: Update a supplier
+      operationId: patchSupplier
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/id"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                name: { type: string }
+                phone: { type: string }
+                note: { type: string }
+      responses:
+        "200":
+          description: The supplier
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Supplier" }
+    delete:
+      tags: [Suppliers]
+      summary: Delete (hide) a supplier
+      description: Receipts and payments stay in the books.
+      operationId: deleteSupplier
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/id"
+      responses:
+        "204":
+          description: Deleted
+
+  /v1/suppliers/{id}/statement:
+    get:
+      tags: [Suppliers]
+      summary: Receipts vs payments and the balance owed
+      operationId: supplierStatement
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/id"
+      responses:
+        "200":
+          description: Statement
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  supplier: { $ref: "#/components/schemas/Supplier" }
+                  entries:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        kind: { type: string, enum: [receipt, payment] }
+                        id: { type: string, format: uuid }
+                        at: { type: string, format: date-time }
+                        amount_minor: { type: integer }
+                        detail: { type: string }
+                  total_received_minor: { type: integer }
+                  total_paid_minor: { type: integer }
+                  balance_owed_minor: { type: integer }
+
+  /v1/supplier-payments:
+    post:
+      tags: [Suppliers]
+      summary: Pay a supplier
+      description: |
+        Manager or admin. Posts Dr 2150 Goods received / Cr outlet cash (method cash) or
+        Cr 1100 clearing (method bank). A payment the cash or clearing account cannot cover is rejected.
+      operationId: createSupplierPayment
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [supplier_id, outlet_id, amount_minor, method]
+              additionalProperties: false
+              properties:
+                supplier_id: { type: string, format: uuid }
+                outlet_id: { type: string, format: uuid }
+                amount_minor: { type: integer, minimum: 1 }
+                method: { type: string, enum: [cash, bank] }
+                note: { type: string }
+      responses:
+        "201":
+          description: The payment and its journal id
+          content:
+            application/json:
+              schema: { type: object }
+
+  /v1/reports/vat:
+    get:
+      tags: [Reports]
+      summary: VAT summary by month
+      description: |
+        Admin only. Output VAT is credits to 2100 from sale journals; reversed VAT is debits to 2100
+        (refunds, voids, hand-posted remittances). Months are Africa/Lagos. Input VAT is a placeholder 0.
+        Defaults to the last 12 months.
+      operationId: vatReport
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { in: query, name: from, schema: { type: string } }
+        - { in: query, name: to, schema: { type: string } }
+      responses:
+        "200":
+          description: Monthly and total VAT
+          content:
+            application/json:
+              schema: { type: object }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -1409,6 +1985,77 @@ components:
           schema: { $ref: "#/components/schemas/Error" }
 
   schemas:
+    Shift:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        outlet_id: { type: string, format: uuid }
+        staff_id: { type: string, format: uuid }
+        status: { type: string, enum: [open, closed] }
+        opening_float_minor: { type: integer }
+        opened_at: { type: string, format: date-time }
+        closed_at: { type: string, format: date-time, nullable: true }
+        closed_by: { type: string, format: uuid, nullable: true }
+        expected_cash_minor: { type: integer, nullable: true }
+        counted_cash_minor: { type: integer, nullable: true }
+        variance_minor: { type: integer, nullable: true }
+        variance_journal_id: { type: string, format: uuid, nullable: true }
+        note: { type: string }
+        z_report: { $ref: "#/components/schemas/ZReport" }
+    ZReport:
+      type: object
+      properties:
+        shift_id: { type: string, format: uuid }
+        opening_float_minor: { type: integer }
+        sales_count: { type: integer }
+        refund_count: { type: integer }
+        cash_sales_minor: { type: integer }
+        cash_in_minor: { type: integer }
+        cash_out_minor: { type: integer }
+        refunds_minor: { type: integer }
+        expected_cash_minor: { type: integer }
+        counted_cash_minor: { type: integer, nullable: true }
+        variance_minor: { type: integer, nullable: true }
+    Event:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        type: { type: string }
+        outlet_id: { type: string, format: uuid, nullable: true }
+        occurred_at: { type: string, format: date-time }
+        data: { type: object }
+    WebhookEndpoint:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        url: { type: string }
+        event_types: { type: array, items: { type: string } }
+        secret: { type: string, description: Returned only when the endpoint is created. }
+        created_at: { type: string, format: date-time }
+    StockTransfer:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        from_outlet_id: { type: string, format: uuid }
+        to_outlet_id: { type: string, format: uuid }
+        status: { type: string, enum: [in_transit, received, cancelled] }
+        note: { type: string }
+        created_at: { type: string, format: date-time }
+        lines:
+          type: array
+          items:
+            type: object
+            properties:
+              sku: { type: string }
+              quantity: { type: integer }
+    Supplier:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        phone: { type: string }
+        note: { type: string }
+        created_at: { type: string, format: date-time }
     NextCursor:
       type: string
       nullable: true

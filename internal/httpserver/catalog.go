@@ -46,6 +46,7 @@ type stockReq struct {
 	Delta         int             `json:"delta"`
 	Reason        string          `json:"reason"`
 	UnitCostMinor json.RawMessage `json:"unit_cost_minor"`
+	SupplierID    string          `json:"supplier_id"` // receipts only (Phase 3B)
 }
 
 func outletBody(o store.Outlet) map[string]any {
@@ -368,10 +369,29 @@ func (s *Server) stockMove(w http.ResponseWriter, r *http.Request, adjust bool) 
 		}
 		unit = &n
 	}
+	var supplierID *uuid.UUID
+	if sid := strings.TrimSpace(in.SupplierID); sid != "" {
+		parsed, err := uuid.Parse(sid)
+		if err != nil || adjust {
+			writeError(w, http.StatusBadRequest, "invalid_order", "supplier_id must be a supplier id and is only for receipts")
+			return
+		}
+		if _, err := s.store.GetSupplier(r.Context(), s.store.Pool, actor.MerchantID, parsed); err != nil {
+			writeLedgerError(w, err)
+			return
+		}
+		supplierID = &parsed
+	}
 	s.finishIdempotent(w, r, actor.MerchantID, key, fingerprint(r, raw), func(tx pgx.Tx) (int, []byte, *uuid.UUID, error) {
 		merchant, err := s.store.EnsureBooks(r.Context(), tx, actor.MerchantID)
 		if err != nil {
 			return 0, nil, nil, err
+		}
+		var supplierUnit int64
+		if supplierID != nil {
+			if supplierUnit, err = s.supplierReceiptCost(r.Context(), tx, actor.MerchantID, product.ID, unit); err != nil {
+				return 0, nil, nil, err
+			}
 		}
 		body := map[string]any{"sku": product.SKU, "outlet_id": outlet.ID}
 		if adjust {
@@ -390,6 +410,13 @@ func (s *Server) stockMove(w http.ResponseWriter, r *http.Request, adjust bool) 
 			})
 			if err != nil {
 				return 0, nil, nil, err
+			}
+			if supplierID != nil {
+				if err := s.store.RecordSupplierReceipt(r.Context(), tx, actor.MerchantID, *supplierID, outlet.ID, product.ID, actor.ID,
+					product.SKU, in.Qty, supplierUnit*int64(in.Qty)); err != nil {
+					return 0, nil, nil, err
+				}
+				body["supplier_id"] = *supplierID
 			}
 			body["on_hand"] = onHand
 			body["avg_cost_minor"] = avg
