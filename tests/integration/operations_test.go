@@ -29,20 +29,13 @@ func (c *apiClient) mustStatus(res *http.Response, want int) map[string]any {
 	return out
 }
 
-func (c *apiClient) receiveCost(outlet, sku string, qty int, unit int64, extra map[string]any) map[string]any {
+func (c *apiClient) receiveWith(outlet, sku string, qty int, unit int64, extra map[string]any) map[string]any {
 	c.t.Helper()
 	body := map[string]any{"outlet_id": outlet, "sku": sku, "qty": qty, "unit_cost_minor": unit}
 	for k, v := range extra {
 		body[k] = v
 	}
 	return c.mustStatus(c.do(http.MethodPost, "/v1/stock/receipts", body, nil), 200)
-}
-
-func (sh *shop) staffClient(role, outlet string) *apiClient {
-	sh.t.Helper()
-	email := fmt.Sprintf("%s-%s@test.local", role, uuid.NewString()[:8])
-	sh.admin.addStaff(email, role, outlet)
-	return loginEmail(sh.t, email)
 }
 
 func onHand(t *testing.T, c *apiClient, outlet, sku string) int {
@@ -312,7 +305,7 @@ func TestEventFeedAndWebhooks(t *testing.T) {
 func TestStockTransfers(t *testing.T) {
 	sh := openShop(t, 0)
 	sh.admin.createProduct("LAMP", "Lamp", 500_000, 0)
-	sh.admin.receiveCost(sh.ikeja, "LAMP", 10, 200_000, nil)
+	sh.admin.receiveWith(sh.ikeja, "LAMP", 10, 200_000, nil)
 	mgr := sh.staffClient("manager", sh.ikeja)
 	body := map[string]any{"from_outlet_id": sh.ikeja, "to_outlet_id": sh.sul, "lines": []map[string]any{{"sku": "LAMP", "quantity": 4}}, "note": "restock"}
 
@@ -396,7 +389,7 @@ func TestStockTransfers(t *testing.T) {
 func TestStockCount(t *testing.T) {
 	sh := openShop(t, 0)
 	sh.admin.createProduct("CUP", "Cup", 100_000, 0)
-	sh.admin.receiveCost(sh.ikeja, "CUP", 10, 20_000, nil)
+	sh.admin.receiveWith(sh.ikeja, "CUP", 10, 20_000, nil)
 	invBefore := sh.bal("1200")
 
 	count := func(counted int) (*http.Response, map[string]any) {
@@ -464,7 +457,7 @@ func TestSuppliersAndPayments(t *testing.T) {
 	if missing.StatusCode != 404 {
 		t.Fatalf("receipt with unknown supplier %d", missing.StatusCode)
 	}
-	sh.admin.receiveCost(sh.ikeja, "RICE", 10, 30_000, map[string]any{"supplier_id": supID})
+	sh.admin.receiveWith(sh.ikeja, "RICE", 10, 30_000, map[string]any{"supplier_id": supID})
 	if sh.bal("2150") != 300_000 {
 		t.Fatalf("2150 = %d", sh.bal("2150"))
 	}
