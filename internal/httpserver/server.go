@@ -50,18 +50,17 @@ func New(cfg config.Config, st *store.Store, log *slog.Logger) *Server {
 		cfg: cfg, store: st, log: log, metrics: newMetrics(),
 		argon:        auth.NewVerifier(4),
 		ipLimiter:    ratelimit.New(ipRate, float64(ipRate)),
-		emailLimiter: ratelimit.New(12, float64(emailRate)),
+		emailLimiter: ratelimit.New(emailRate, float64(emailRate)),
 	}
 	r := chi.NewRouter()
 	r.Use(s.observe, s.recoverer, s.cors, s.headers)
 	r.NotFound(s.notFound)
 	r.MethodNotAllowed(s.methodNotAllowed)
-	r.Get("/v1/health", s.health)
 	r.Get("/livez", s.livez)
 	r.Get("/readyz", s.readyz)
 	r.Get("/metrics", s.metricsHandler)
 	r.Post("/v1/auth/login", s.login)
-	r.Post("/v1/webhooks/paystack", s.paystackWebhook)
+	r.Post("/v1/webhooks/{connection_id}", s.paymentWebhook)
 
 	r.Group(func(r chi.Router) {
 		r.Use(s.authn)
@@ -92,6 +91,8 @@ func New(cfg config.Config, st *store.Store, log *slog.Logger) *Server {
 			r.Get("/v1/reports/daily-sales", s.dailySales)
 			r.Get("/v1/audit", s.listAuditPage)
 			r.Get("/v1/unmatched-payments", s.listUnmatched)
+			r.Get("/v1/payment-connections", s.listConnections)
+			r.Post("/v1/payment-connections/{id}/payments", s.recordPayment)
 			r.Post("/v1/unmatched-payments/{id}/apply", s.applyUnmatched)
 			r.Post("/v1/unmatched-payments/{id}/refund", s.refundUnmatched)
 			r.Post("/v1/unmatched-payments/{id}/refunded", s.settleUnmatched)
@@ -107,6 +108,9 @@ func New(cfg config.Config, st *store.Store, log *slog.Logger) *Server {
 			r.Get("/v1/api-keys", s.listAPIKeys)
 			r.Delete("/v1/api-keys/{id}", s.revokeAPIKey)
 			r.Post("/v1/outlets", s.createOutlet)
+			r.Post("/v1/payment-connections", s.createConnection)
+			r.Delete("/v1/payment-connections/{id}", s.disableConnection)
+			r.Post("/v1/payment-connections/{id}/settlements", s.settleConnection)
 			r.Get("/v1/merchant/settings", s.getSettings)
 			r.Patch("/v1/merchant/settings", s.patchSettings)
 			r.Get("/v1/invariants", s.invariants)
@@ -114,12 +118,8 @@ func New(cfg config.Config, st *store.Store, log *slog.Logger) *Server {
 			r.Get("/v1/accounts", s.listAccounts)
 			r.Get("/v1/accounts/{id}", s.getAccount)
 			r.Get("/v1/accounts/{id}/statement", s.statement)
-			r.Post("/v1/accounts/{id}/close", s.closeAccount)
-			r.Post("/v1/transfers", s.postTransfer)
-			r.Get("/v1/transfers", s.listJournalsPaged(true))
-			r.Get("/v1/transfers/{id}", s.getJournal)
 			r.Post("/v1/journals", s.postJournal)
-			r.Get("/v1/journals", s.listJournalsPaged(false))
+			r.Get("/v1/journals", s.listJournals)
 			r.Get("/v1/journals/{id}", s.getJournal)
 			r.Post("/v1/journals/{id}/reversal", s.reverseJournal)
 		})
@@ -131,33 +131,8 @@ func New(cfg config.Config, st *store.Store, log *slog.Logger) *Server {
 
 func (s *Server) Router() chi.Router { return s.router }
 
-func (s *Server) poster() ledger.StorePoster {
-	return ledger.StorePoster{
-		LockAccounts:  s.store.LockAccounts,
-		InsertJournal: s.store.InsertJournal,
-		InsertPosting: s.store.InsertPosting,
-		UpdateBalance: s.store.UpdateBalance,
-	}
-}
-
-func (s *Server) health(w http.ResponseWriter, r *http.Request) {
-	if err := s.store.Ping(r.Context()); err != nil {
-		writeError(w, http.StatusServiceUnavailable, "unhealthy", "database unreachable")
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
-}
-
-func WithStaff(ctx context.Context, st store.Staff) context.Context {
-	return context.WithValue(ctx, staffKey, st)
-}
-
-func StaffFrom(r *http.Request) store.Staff {
-	return r.Context().Value(staffKey).(store.Staff)
-}
-
 func (s *Server) staff(r *http.Request) store.Staff {
-	return StaffFrom(r)
+	return r.Context().Value(staffKey).(store.Staff)
 }
 
 func (s *Server) parseID(w http.ResponseWriter, r *http.Request) (uuid.UUID, bool) {

@@ -12,26 +12,6 @@ import (
 	"github.com/google/uuid"
 )
 
-func TestHealth(t *testing.T) {
-	c := startAPI(t)
-	res := c.do(http.MethodGet, "/v1/health", nil, nil)
-	if res.StatusCode != 200 {
-		t.Fatalf("health %d", res.StatusCode)
-	}
-	decode(t, res, nil)
-}
-
-func TestRegisterIsGone(t *testing.T) {
-	c := startAPI(t)
-	res := c.do(http.MethodPost, "/v1/auth/register", map[string]string{
-		"email": "short@test.local", "password": "change-me-now-12",
-	}, nil)
-	if res.StatusCode != 404 {
-		t.Fatalf("register still mounted: %d", res.StatusCode)
-	}
-	decode(t, res, nil)
-}
-
 func book(t *testing.T) (*apiClient, string, string, string, string, string) {
 	t.Helper()
 	c := startAPI(t)
@@ -54,14 +34,6 @@ func book(t *testing.T) (*apiClient, string, string, string, string, string) {
 	return c, cash, alice, bob, equity, fees
 }
 
-func TestOpeningInvariantHolds(t *testing.T) {
-	c, _, _, _, _, _ := book(t)
-	idn := c.identity()
-	if idn["holds"] != true || idn["identity_minor"].(float64) != 0 || idn["cache_drift"].(float64) != 0 {
-		t.Fatalf("invariant %#v", idn)
-	}
-}
-
 func TestUnbalancedJournalRejected(t *testing.T) {
 	c, cash, alice, _, _, _ := book(t)
 	res, out := c.postJournal("bad-"+uuid.NewString(), map[string]any{
@@ -76,71 +48,25 @@ func TestUnbalancedJournalRejected(t *testing.T) {
 	}
 }
 
-func TestFloatAmountRejected(t *testing.T) {
+func TestNonIntegerAmountRejected(t *testing.T) {
 	c, cash, alice, _, _, _ := book(t)
-	h := http.Header{}
-	h.Set("Idempotency-Key", uuid.NewString())
-	raw := fmt.Sprintf(`{"debit_account_id":%q,"credit_account_id":%q,"amount_minor":10.5}`, cash, alice)
-	res := c.doRaw(http.MethodPost, "/v1/transfers", raw, h)
-	var out map[string]any
-	decode(t, res, &out)
-	if res.StatusCode != 400 {
-		t.Fatalf("float accepted: %d %v", res.StatusCode, out)
-	}
-}
-
-func TestScientificNotationRejected(t *testing.T) {
-	c, cash, alice, _, _, _ := book(t)
-	h := http.Header{}
-	h.Set("Idempotency-Key", uuid.NewString())
-	raw := fmt.Sprintf(`{"debit_account_id":%q,"credit_account_id":%q,"amount_minor":1e2}`, cash, alice)
-	res := c.doRaw(http.MethodPost, "/v1/transfers", raw, h)
-	var out map[string]any
-	decode(t, res, &out)
-	if res.StatusCode != 400 {
-		t.Fatalf("1e2 accepted: %d %v", res.StatusCode, out)
-	}
-}
-
-func TestDepositP2PAndFee(t *testing.T) {
-	c, cash, alice, bob, _, fees := book(t)
-	res, out := c.postTransfer(uuid.NewString(), cash, alice, 50_000, "deposit alice")
-	if res.StatusCode != 201 {
-		t.Fatalf("deposit %d %v", res.StatusCode, out)
-	}
-	res, out = c.postTransfer(uuid.NewString(), alice, bob, 5_000, "p2p")
-	if res.StatusCode != 201 {
-		t.Fatalf("p2p %d %v", res.StatusCode, out)
-	}
-	res, out = c.postTransfer(uuid.NewString(), alice, fees, 100, "fee")
-	if res.StatusCode != 201 {
-		t.Fatalf("fee %d %v", res.StatusCode, out)
-	}
-	if c.account(alice)["balance_minor"].(float64) != 44900 {
-		t.Fatalf("alice %v", c.account(alice))
-	}
-	if c.account(bob)["balance_minor"].(float64) != 5000 {
-		t.Fatalf("bob %v", c.account(bob))
-	}
-	idn := c.identity()
-	if idn["holds"] != true {
-		t.Fatalf("invariant %#v", idn)
+	for _, amt := range []string{"10.5", "1e2"} {
+		h := http.Header{}
+		h.Set("Idempotency-Key", uuid.NewString())
+		raw := fmt.Sprintf(`{"description":"x","postings":[{"account_id":%q,"direction":"debit","amount_minor":%s},{"account_id":%q,"direction":"credit","amount_minor":%s}]}`, cash, amt, alice, amt)
+		res := c.doRaw(http.MethodPost, "/v1/journals", raw, h)
+		var out map[string]any
+		decode(t, res, &out)
+		if res.StatusCode != 400 {
+			t.Fatalf("%s accepted: %d %v", amt, res.StatusCode, out)
+		}
 	}
 }
 
 func TestOverdraftRejected(t *testing.T) {
 	c, _, alice, bob, _, _ := book(t)
-	res, out := c.postTransfer(uuid.NewString(), alice, bob, 1, "no funds")
+	res, out := c.postPair(uuid.NewString(), alice, bob, 1, "no funds")
 	if res.StatusCode != 400 || errCode(out) != "insufficient_funds" {
-		t.Fatalf("got %d %v", res.StatusCode, out)
-	}
-}
-
-func TestDisallowedPair(t *testing.T) {
-	c, cash, _, _, _, fees := book(t)
-	// income as debit is forbidden on transfers
-	res, out := c.postTransfer(uuid.NewString(), fees, cash, 1, "income debit")
-	if res.StatusCode != 400 || errCode(out) != "pair_not_allowed" {
 		t.Fatalf("got %d %v", res.StatusCode, out)
 	}
 }
@@ -148,18 +74,18 @@ func TestDisallowedPair(t *testing.T) {
 func TestIdempotentReplayAndConflict(t *testing.T) {
 	c, cash, alice, _, _, _ := book(t)
 	key := "idem-" + uuid.NewString()
-	res1, out1 := c.postTransfer(key, cash, alice, 1000, "deposit")
+	res1, out1 := c.postPair(key, cash, alice, 1000, "deposit")
 	if res1.StatusCode != 201 {
 		t.Fatalf("first %d %v", res1.StatusCode, out1)
 	}
-	res2, out2 := c.postTransfer(key, cash, alice, 1000, "deposit")
+	res2, out2 := c.postPair(key, cash, alice, 1000, "deposit")
 	if res2.StatusCode != 201 {
 		t.Fatalf("replay %d %v", res2.StatusCode, out2)
 	}
 	if out1["id"] != out2["id"] {
 		t.Fatalf("replay minted a new journal: %v vs %v", out1["id"], out2["id"])
 	}
-	res3, out3 := c.postTransfer(key, cash, alice, 2000, "different")
+	res3, out3 := c.postPair(key, cash, alice, 2000, "different")
 	if res3.StatusCode != 409 || errCode(out3) != "idempotency_conflict" {
 		t.Fatalf("conflict %d %v", res3.StatusCode, out3)
 	}
@@ -167,7 +93,7 @@ func TestIdempotentReplayAndConflict(t *testing.T) {
 
 func TestReversalRestoresBalancesAndLeavesOriginal(t *testing.T) {
 	c, cash, alice, _, _, _ := book(t)
-	res, posted := c.postTransfer(uuid.NewString(), cash, alice, 8000, "deposit")
+	res, posted := c.postPair(uuid.NewString(), cash, alice, 8000, "deposit")
 	if res.StatusCode != 201 {
 		t.Fatalf("deposit %d %v", res.StatusCode, posted)
 	}
@@ -217,22 +143,9 @@ func TestIDOR(t *testing.T) {
 	}
 }
 
-func TestClosedAccountRejectsPosting(t *testing.T) {
-	c, cash, alice, _, _, _ := book(t)
-	res := c.do(http.MethodPost, "/v1/accounts/"+alice+"/close", nil, nil)
-	if res.StatusCode != 200 {
-		t.Fatalf("close %d", res.StatusCode)
-	}
-	decode(t, res, nil)
-	res2, out := c.postTransfer(uuid.NewString(), cash, alice, 10, "to closed")
-	if res2.StatusCode != 400 || errCode(out) != "closed_account" {
-		t.Fatalf("got %d %v", res2.StatusCode, out)
-	}
-}
-
 func TestNLeggedJournal(t *testing.T) {
 	c, cash, alice, bob, _, fees := book(t)
-	_, _ = c.postTransfer(uuid.NewString(), cash, alice, 10_000, "fund")
+	_, _ = c.postPair(uuid.NewString(), cash, alice, 10_000, "fund")
 	res, out := c.postJournal("split-"+uuid.NewString(), map[string]any{
 		"description": "p2p with fee",
 		"postings": []map[string]any{
@@ -251,7 +164,7 @@ func TestNLeggedJournal(t *testing.T) {
 
 func TestConcurrentTransfersPreserveInvariant(t *testing.T) {
 	c, cash, alice, bob, _, _ := book(t)
-	_, _ = c.postTransfer(uuid.NewString(), cash, alice, 100_000, "fund")
+	_, _ = c.postPair(uuid.NewString(), cash, alice, 100_000, "fund")
 	const n = 50
 	var ok atomic.Int64
 	var wg sync.WaitGroup
@@ -260,7 +173,7 @@ func TestConcurrentTransfersPreserveInvariant(t *testing.T) {
 		i := i
 		go func() {
 			defer wg.Done()
-			res, _ := c.postTransfer(fmt.Sprintf("c-%d-%s", i, uuid.NewString()), alice, bob, 100, "burst")
+			res, _ := c.postPair(fmt.Sprintf("c-%d-%s", i, uuid.NewString()), alice, bob, 100, "burst")
 			if res.StatusCode == 201 {
 				ok.Add(1)
 			}
@@ -291,7 +204,7 @@ func TestConcurrentSameIdempotencyKey(t *testing.T) {
 	for i := 0; i < 20; i++ {
 		go func() {
 			defer wg.Done()
-			res, out := c.postTransfer(key, cash, alice, 2500, "once")
+			res, out := c.postPair(key, cash, alice, 2500, "once")
 			if res.StatusCode == 201 {
 				mu.Lock()
 				ids = append(ids, out["id"].(string))
@@ -316,8 +229,8 @@ func TestConcurrentSameIdempotencyKey(t *testing.T) {
 
 func TestStatementRunningBalance(t *testing.T) {
 	c, cash, alice, _, _, _ := book(t)
-	_, _ = c.postTransfer(uuid.NewString(), cash, alice, 1000, "d1")
-	_, _ = c.postTransfer(uuid.NewString(), cash, alice, 2000, "d2")
+	_, _ = c.postPair(uuid.NewString(), cash, alice, 1000, "d1")
+	_, _ = c.postPair(uuid.NewString(), cash, alice, 2000, "d2")
 	res := c.do(http.MethodGet, "/v1/accounts/"+alice+"/statement", nil, nil)
 	var out struct {
 		Balance int64 `json:"balance_minor"`
@@ -344,7 +257,7 @@ func TestStatementRunningBalance(t *testing.T) {
 
 func TestPostedJournalImmutable(t *testing.T) {
 	c, cash, alice, _, _, _ := book(t)
-	res, posted := c.postTransfer(uuid.NewString(), cash, alice, 100, "lock")
+	res, posted := c.postPair(uuid.NewString(), cash, alice, 100, "lock")
 	if res.StatusCode != 201 {
 		t.Fatalf("post %d %v", res.StatusCode, posted)
 	}

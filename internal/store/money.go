@@ -65,39 +65,6 @@ type ProviderEvent struct {
 	ResponseBody   []byte
 }
 
-// ClaimProviderEvent records that (provider, eventID) is being handled. When
-// another request already holds or finished the event, claimed is false and
-// the stored result is returned. The insert waits on a concurrent claimer.
-func (s *Store) ClaimProviderEvent(ctx context.Context, tx pgx.Tx, provider, eventID string) (ProviderEvent, bool, error) {
-	var got string
-	err := tx.QueryRow(ctx, `
-		INSERT INTO provider_events (provider, event_id, outcome) VALUES ($1, $2, 'processing')
-		ON CONFLICT (provider, event_id) DO NOTHING
-		RETURNING provider
-	`, provider, eventID).Scan(&got)
-	if err == nil {
-		return ProviderEvent{}, true, nil
-	}
-	if !errors.Is(err, pgx.ErrNoRows) {
-		return ProviderEvent{}, false, err
-	}
-	var ev ProviderEvent
-	err = tx.QueryRow(ctx, `
-		SELECT outcome, order_id, response_status, response_body
-		FROM provider_events WHERE provider = $1 AND event_id = $2
-	`, provider, eventID).Scan(&ev.Outcome, &ev.OrderID, &ev.ResponseStatus, &ev.ResponseBody)
-	return ev, false, err
-}
-
-func (s *Store) FinishProviderEvent(ctx context.Context, tx pgx.Tx, provider, eventID string, merchantID, orderID *uuid.UUID, outcome string, status int, body []byte) error {
-	_, err := tx.Exec(ctx, `
-		UPDATE provider_events
-		SET merchant_id = $3, order_id = $4, outcome = $5, response_status = $6, response_body = $7
-		WHERE provider = $1 AND event_id = $2
-	`, provider, eventID, merchantID, orderID, outcome, status, body)
-	return err
-}
-
 type Unmatched struct {
 	ID                  uuid.UUID
 	MerchantID          uuid.UUID
@@ -115,25 +82,30 @@ type Unmatched struct {
 	JournalID           *uuid.UUID
 	ResolutionJournalID *uuid.UUID
 	SettlementJournalID *uuid.UUID
+	// ConnectionID is the payment connection the money arrived on.
+	ConnectionID *uuid.UUID
+	// Details is who paid and how, as the provider reported it (JSON).
+	Details []byte
 }
 
 const unmatchedCols = `id, merchant_id, order_id, outlet_id, provider, event_id, amount_minor, currency, reason, status,
-	created_at, resolved_at, resolved_by, journal_id, resolution_journal_id, settlement_journal_id`
+	created_at, resolved_at, resolved_by, journal_id, resolution_journal_id, settlement_journal_id, connection_id, details`
 
 func scanUnmatched(sc interface{ Scan(...any) error }) (Unmatched, error) {
 	var u Unmatched
 	err := sc.Scan(&u.ID, &u.MerchantID, &u.OrderID, &u.OutletID, &u.Provider, &u.EventID, &u.AmountMinor, &u.Currency,
-		&u.Reason, &u.Status, &u.CreatedAt, &u.ResolvedAt, &u.ResolvedBy, &u.JournalID, &u.ResolutionJournalID, &u.SettlementJournalID)
+		&u.Reason, &u.Status, &u.CreatedAt, &u.ResolvedAt, &u.ResolvedBy, &u.JournalID, &u.ResolutionJournalID, &u.SettlementJournalID,
+		&u.ConnectionID, &u.Details)
 	return u, err
 }
 
 func (s *Store) InsertUnmatched(ctx context.Context, tx pgx.Tx, u Unmatched) error {
 	_, err := tx.Exec(ctx, `
 		INSERT INTO unmatched_payments (id, merchant_id, order_id, outlet_id, provider, event_id, amount_minor, currency,
-			reason, status, created_at, resolved_at, resolved_by, journal_id)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+			reason, status, created_at, resolved_at, resolved_by, journal_id, connection_id, details)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
 	`, u.ID, u.MerchantID, u.OrderID, u.OutletID, u.Provider, u.EventID, u.AmountMinor, u.Currency,
-		u.Reason, u.Status, u.CreatedAt, u.ResolvedAt, u.ResolvedBy, u.JournalID)
+		u.Reason, u.Status, u.CreatedAt, u.ResolvedAt, u.ResolvedBy, u.JournalID, u.ConnectionID, u.Details)
 	return err
 }
 

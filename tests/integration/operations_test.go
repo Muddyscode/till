@@ -479,10 +479,20 @@ func TestSuppliersAndPayments(t *testing.T) {
 	if res, out := pay("cash", 5_000_000); res.StatusCode == 201 {
 		t.Fatalf("overdrawn cash payment accepted %v", out)
 	}
-	// Bank payments draw on 1100: fund it with a paid transfer sale.
+	// Bank payments draw on 1050 Bank: a paid transfer sale lands in the
+	// provider's clearing account and a settlement moves it to the bank.
 	_, ord := sh.admin.order("tr-"+uuid.NewString(), sh.ikeja, "transfer", "RICE", 1)
 	if res, _ := sh.admin.webhook(nextEvent(), ord["reference"].(string), 100_000, "NGN"); res.StatusCode != 200 {
 		t.Fatalf("webhook %d", res.StatusCode)
+	}
+	if res, out := pay("bank", 50_000); res.StatusCode == 201 {
+		t.Fatalf("bank payment accepted before any money reached the bank %v", out)
+	}
+	if res, out := sh.admin.postKeyed("/v1/payment-connections/"+sh.admin.paystackConn()+"/settlements", "st-"+uuid.NewString(), map[string]any{"amount_minor": 100_000, "reference": "PAYOUT-1"}); res.StatusCode != 201 {
+		t.Fatalf("settlement %d %v", res.StatusCode, out)
+	}
+	if sh.bal("1100-PSTK") != 0 || sh.bal("1050") != 100_000 {
+		t.Fatalf("after settlement clearing %d bank %d", sh.bal("1100-PSTK"), sh.bal("1050"))
 	}
 	if res, out := pay("bank", 50_000); res.StatusCode != 201 {
 		t.Fatalf("bank payment %d %v", res.StatusCode, out)

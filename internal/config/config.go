@@ -12,23 +12,21 @@ const (
 	EnvDevelopment = "development"
 	EnvProduction  = "production"
 
-	// ExampleJWTSecret and ExamplePaystackSecret are the values shipped in .env.example.
-	// Production refuses to start with them.
-	ExampleJWTSecret      = "dev-only-change-me-use-32chars-min!!"
-	ExamplePaystackSecret = "dev-paystack-secret"
+	// ExampleJWTSecret is the value shipped in .env.example. Production refuses
+	// to start with it.
+	ExampleJWTSecret = "dev-only-change-me-use-32chars-min!!"
 )
 
 type Config struct {
-	Env            string
-	DatabaseURL    string
-	HTTPAddr       string
-	JWTSecret      string
-	PaystackSecret string
-	Seed           bool
-	SeedPassword   string
-	HoldMinutes    int
-	TokenTTL       time.Duration
-	CORSOrigins    []string
+	Env          string
+	DatabaseURL  string
+	HTTPAddr     string
+	JWTSecret    string
+	Seed         bool
+	SeedPassword string
+	HoldMinutes  int
+	TokenTTL     time.Duration
+	CORSOrigins  []string
 	// TrustProxy makes the login rate limiter use the last X-Forwarded-For entry
 	// (the one appended by your own reverse proxy) instead of the socket address.
 	TrustProxy bool
@@ -59,7 +57,6 @@ func FromEnv() (Config, error) {
 		DatabaseURL:       os.Getenv("TILL_DATABASE_URL"),
 		HTTPAddr:          getenv("TILL_HTTP_ADDR", ":8080"),
 		JWTSecret:         os.Getenv("TILL_JWT_SECRET"),
-		PaystackSecret:    os.Getenv("TILL_PAYSTACK_SECRET"),
 		Seed:              boolEnv("TILL_SEED", false),
 		SeedPassword:      getenv("TILL_SEED_PASSWORD", "change-me-now-12"),
 		HoldMinutes:       hold,
@@ -86,9 +83,6 @@ func (c Config) Validate() error {
 	if len(c.JWTSecret) < 32 {
 		return fmt.Errorf("TILL_JWT_SECRET must be at least 32 characters")
 	}
-	if len(c.PaystackSecret) < 16 {
-		return fmt.Errorf("TILL_PAYSTACK_SECRET must be at least 16 characters")
-	}
 	if c.Seed && len(c.SeedPassword) < 12 {
 		return fmt.Errorf("TILL_SEED_PASSWORD must be at least 12 characters")
 	}
@@ -96,14 +90,8 @@ func (c Config) Validate() error {
 		if c.JWTSecret == ExampleJWTSecret || strings.Contains(c.JWTSecret, "dev-only") {
 			return fmt.Errorf("production: TILL_JWT_SECRET is a development value")
 		}
-		if c.PaystackSecret == ExamplePaystackSecret || strings.HasPrefix(c.PaystackSecret, "dev-") {
-			return fmt.Errorf("production: TILL_PAYSTACK_SECRET is a development value")
-		}
 		if len(c.JWTSecret) < 48 {
 			return fmt.Errorf("production: TILL_JWT_SECRET must be at least 48 characters")
-		}
-		if len(c.PaystackSecret) < 24 {
-			return fmt.Errorf("production: TILL_PAYSTACK_SECRET must be at least 24 characters")
 		}
 		if c.Seed {
 			return fmt.Errorf("production: TILL_SEED must not be true")

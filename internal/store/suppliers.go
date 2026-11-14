@@ -104,15 +104,19 @@ type SupplierPayment struct {
 	CreatedAt   time.Time
 }
 
-// PaySupplier posts Dr 2150 Goods received / Cr outlet cash (cash) or Cr 1100
-// clearing (bank) and records the payment.
+// PaySupplier posts Dr 2150 Goods received / Cr outlet cash (cash) or Cr 1050
+// Bank (bank) and records the payment.
 func (s *Store) PaySupplier(ctx context.Context, tx pgx.Tx, m Merchant, outlet Outlet, supplierID, staffID uuid.UUID, amount int64, method, note string) (SupplierPayment, error) {
-	if m.GoodsReceivedAccountID == nil || m.ClearingAccountID == nil {
+	if m.GoodsReceivedAccountID == nil {
 		return SupplierPayment{}, ledger.Err(ledger.CodeInvalidOrder, "merchant books are not set up")
 	}
 	credit := outlet.CashAccountID
 	if method == "bank" {
-		credit = *m.ClearingAccountID
+		bank, err := s.EnsureAccount(ctx, tx, m.ID, BankAccountCode, "Bank", ledger.Asset, false)
+		if err != nil {
+			return SupplierPayment{}, err
+		}
+		credit = bank
 	}
 	j, err := ledger.Post(ctx, tx, s.Poster(), ledger.PostRequest{
 		MerchantID:  m.ID,

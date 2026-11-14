@@ -110,20 +110,6 @@ func (s *Store) GetAccount(ctx context.Context, db DBTX, operatorID, accountID u
 	return a, err
 }
 
-func (s *Store) GetAccountByCode(ctx context.Context, db DBTX, operatorID uuid.UUID, code string) (ledger.Account, error) {
-	var a ledger.Account
-	err := db.QueryRow(ctx, `
-		SELECT id, merchant_id, code, name, type, currency, allow_negative, status, balance_minor, created_at
-		FROM accounts WHERE merchant_id = $1 AND code = $2
-	`, operatorID, code).Scan(
-		&a.ID, &a.MerchantID, &a.Code, &a.Name, &a.Type, &a.Currency, &a.AllowNegative, &a.Status, &a.BalanceMinor, &a.CreatedAt,
-	)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return ledger.Account{}, ledger.Err(ledger.CodeNotFound, "account not found")
-	}
-	return a, err
-}
-
 func (s *Store) ListAccounts(ctx context.Context, db DBTX, operatorID uuid.UUID, typeFilter string) ([]ledger.Account, error) {
 	q := `
 		SELECT id, merchant_id, code, name, type, currency, allow_negative, status, balance_minor, created_at
@@ -149,28 +135,6 @@ func (s *Store) ListAccounts(ctx context.Context, db DBTX, operatorID uuid.UUID,
 		out = append(out, a)
 	}
 	return out, rows.Err()
-}
-
-func (s *Store) CloseAccount(ctx context.Context, db DBTX, operatorID, accountID uuid.UUID) (ledger.Account, error) {
-	var a ledger.Account
-	err := db.QueryRow(ctx, `
-		UPDATE accounts SET status = 'closed'
-		WHERE id = $1 AND merchant_id = $2 AND status = 'open'
-		RETURNING id, merchant_id, code, name, type, currency, allow_negative, status, balance_minor, created_at
-	`, accountID, operatorID).Scan(
-		&a.ID, &a.MerchantID, &a.Code, &a.Name, &a.Type, &a.Currency, &a.AllowNegative, &a.Status, &a.BalanceMinor, &a.CreatedAt,
-	)
-	if errors.Is(err, pgx.ErrNoRows) {
-		existing, gerr := s.GetAccount(ctx, db, operatorID, accountID)
-		if gerr != nil {
-			return ledger.Account{}, gerr
-		}
-		if existing.Status == ledger.AccountClosed {
-			return ledger.Account{}, ledger.Err("already_closed", "account is already closed")
-		}
-		return ledger.Account{}, ledger.Err(ledger.CodeNotFound, "account not found")
-	}
-	return a, err
 }
 
 func (s *Store) LockAccounts(ctx context.Context, tx pgx.Tx, operatorID uuid.UUID, ids []uuid.UUID) ([]ledger.Account, error) {
@@ -216,6 +180,16 @@ func uniq(ids []uuid.UUID) []uuid.UUID {
 		out = append(out, id)
 	}
 	return out
+}
+
+// Poster adapts the store for ledger.Post.
+func (s *Store) Poster() ledger.StorePoster {
+	return ledger.StorePoster{
+		LockAccounts:  s.LockAccounts,
+		InsertJournal: s.InsertJournal,
+		InsertPosting: s.InsertPosting,
+		UpdateBalance: s.UpdateBalance,
+	}
 }
 
 func (s *Store) InsertJournal(ctx context.Context, tx pgx.Tx, j ledger.Journal) error {
@@ -281,44 +255,6 @@ func (s *Store) ListPostings(ctx context.Context, db DBTX, journalIDs []uuid.UUI
 		out[p.JournalID] = append(out[p.JournalID], p)
 	}
 	return out, rows.Err()
-}
-
-func (s *Store) ListJournals(ctx context.Context, db DBTX, operatorID uuid.UUID, limit int, twoLeggedOnly bool) ([]ledger.Journal, error) {
-	q := `
-		SELECT j.id, j.merchant_id, j.status, j.description, COALESCE(j.idempotency_key, ''), j.reverses_journal_id, j.created_at
-		FROM journals j
-		WHERE j.merchant_id = $1
-	`
-	if twoLeggedOnly {
-		q += ` AND (SELECT COUNT(*) FROM postings p WHERE p.journal_id = j.id) = 2`
-	}
-	q += ` ORDER BY j.created_at DESC, j.id DESC LIMIT $2`
-	rows, err := db.Query(ctx, q, operatorID, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var js []ledger.Journal
-	var ids []uuid.UUID
-	for rows.Next() {
-		var j ledger.Journal
-		if err := rows.Scan(&j.ID, &j.MerchantID, &j.Status, &j.Description, &j.IdempotencyKey, &j.ReversesJournalID, &j.CreatedAt); err != nil {
-			return nil, err
-		}
-		js = append(js, j)
-		ids = append(ids, j.ID)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	posts, err := s.ListPostings(ctx, db, ids)
-	if err != nil {
-		return nil, err
-	}
-	for i := range js {
-		js[i].Postings = posts[js[i].ID]
-	}
-	return js, nil
 }
 
 func (s *Store) ReversalOf(ctx context.Context, db DBTX, operatorID, originalID uuid.UUID) (uuid.UUID, bool, error) {
@@ -407,16 +343,6 @@ func (s *Store) Identity(ctx context.Context, db DBTX, operatorID uuid.UUID) (Id
 
 func (s *Store) Ping(ctx context.Context) error {
 	return s.Pool.Ping(ctx)
-}
-
-func (s *Store) CountPostings(ctx context.Context, db DBTX, operatorID uuid.UUID) (int64, error) {
-	var n int64
-	err := db.QueryRow(ctx, `
-		SELECT COUNT(*) FROM postings p
-		JOIN journals j ON j.id = p.journal_id
-		WHERE j.merchant_id = $1
-	`, operatorID).Scan(&n)
-	return n, err
 }
 
 type IdempotencyRecord struct {

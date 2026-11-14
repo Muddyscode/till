@@ -6,10 +6,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Muddyscode/till/internal/auth"
 	"github.com/Muddyscode/till/internal/checkout"
 	"github.com/Muddyscode/till/internal/ledger"
 	"github.com/Muddyscode/till/internal/money"
+	"github.com/Muddyscode/till/internal/payments"
 	"github.com/Muddyscode/till/internal/store"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -116,8 +116,8 @@ func (s *Server) createOrder(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, ledger.CodeInvalidOrder, msg)
 			return
 		}
-	} else if method != "cash" && method != "transfer" && method != "wallet" {
-		writeError(w, http.StatusBadRequest, ledger.CodeInvalidOrder, "payment_method must be cash, transfer, or wallet")
+	} else if method != "cash" && method != "wallet" && !payments.Awaited(method) {
+		writeError(w, http.StatusBadRequest, ledger.CodeInvalidOrder, "payment_method must be cash, wallet, "+strings.Join(payments.AwaitedMethods, ", "))
 		return
 	}
 	discount, err := money.ParseOptionalKobo(in.DiscountMinor)
@@ -141,6 +141,9 @@ func (s *Server) createOrder(w http.ResponseWriter, r *http.Request) {
 	if !split && method != "wallet" && customerID != nil {
 		writeError(w, http.StatusBadRequest, ledger.CodeInvalidOrder, "customer_id is only used for wallet payments")
 		return
+	}
+	if !split {
+		tenders = []checkout.Tender{{Method: method, CustomerID: customerID}}
 	}
 	outletID, err := uuid.Parse(in.OutletID)
 	if err != nil {
@@ -174,20 +177,10 @@ func (s *Server) createOrder(w http.ResponseWriter, r *http.Request) {
 		inSale := checkout.SaleInput{
 			Merchant: merchant, Outlet: outlet, StaffID: actor.ID, Lines: saleLines,
 			Now: time.Now(), Hold: time.Duration(s.cfg.HoldMinutes) * time.Minute,
-			IdempotencyKey: key, DiscountMinor: discount, CustomerID: customerID,
+			IdempotencyKey: key, DiscountMinor: discount,
 			Role: actor.Role, DiscountReason: in.DiscountReason,
 		}
-		var order store.Order
-		switch {
-		case split:
-			order, err = checkout.SaleWithTenders(r.Context(), tx, s.store, inSale, tenders)
-		case method == "cash":
-			order, err = checkout.CashSale(r.Context(), tx, s.store, inSale)
-		case method == "wallet":
-			order, err = checkout.WalletSale(r.Context(), tx, s.store, inSale)
-		default:
-			order, err = checkout.ReserveTransfer(r.Context(), tx, s.store, inSale)
-		}
+		order, err := checkout.SaleWithTenders(r.Context(), tx, s.store, inSale, tenders)
 		if err != nil {
 			return 0, nil, nil, err
 		}
@@ -213,35 +206,6 @@ func (s *Server) getOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, orderBody(o))
-}
-
-func (s *Server) listOrders(w http.ResponseWriter, r *http.Request) {
-	st := s.staff(r)
-	var outletID *uuid.UUID
-	if raw := strings.TrimSpace(r.URL.Query().Get("outlet_id")); raw != "" {
-		id, err := uuid.Parse(raw)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "invalid_order", "outlet_id is invalid")
-			return
-		}
-		if _, ok := s.authorizeOutlet(w, r, id); !ok {
-			return
-		}
-		outletID = &id
-	} else if st.Role != auth.RoleAdmin {
-		writeError(w, http.StatusBadRequest, "invalid_order", "outlet_id is required")
-		return
-	}
-	list, err := s.store.ListOrders(r.Context(), s.store.Pool, st.MerchantID, outletID, limitParam(r, 50, 200))
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", "internal error")
-		return
-	}
-	out := make([]map[string]any, 0, len(list))
-	for _, o := range list {
-		out = append(out, orderBody(o))
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"orders": out})
 }
 
 type refundLineReq struct {
@@ -284,8 +248,8 @@ func (s *Server) refundOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	refundTo := strings.ToLower(strings.TrimSpace(in.RefundTo))
-	if refundTo != "" && refundTo != "cash" && refundTo != "wallet" && refundTo != "transfer" {
-		writeError(w, http.StatusBadRequest, ledger.CodeInvalidOrder, "refund_to must be cash, wallet, or transfer")
+	if refundTo != "" && refundTo != "cash" && refundTo != "wallet" && !payments.Awaited(refundTo) {
+		writeError(w, http.StatusBadRequest, ledger.CodeInvalidOrder, "refund_to must be one of the order's payment methods")
 		return
 	}
 	lines := make([]checkout.RefundLine, 0, len(in.Lines))

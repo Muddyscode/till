@@ -98,19 +98,6 @@ func (s *Server) getAccount(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, acctJSON(acct))
 }
 
-func (s *Server) closeAccount(w http.ResponseWriter, r *http.Request) {
-	id, ok := s.parseID(w, r)
-	if !ok {
-		return
-	}
-	acct, err := s.store.CloseAccount(r.Context(), s.store.Pool, s.staff(r).MerchantID, id)
-	if err != nil {
-		writeLedgerError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, acctJSON(acct))
-}
-
 func (s *Server) statement(w http.ResponseWriter, r *http.Request) {
 	id, ok := s.parseID(w, r)
 	if !ok {

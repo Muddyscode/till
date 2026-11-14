@@ -8,6 +8,7 @@ import (
 	"github.com/Muddyscode/till/internal/checkout"
 	"github.com/Muddyscode/till/internal/ledger"
 	"github.com/Muddyscode/till/internal/money"
+	"github.com/Muddyscode/till/internal/payments"
 	"github.com/Muddyscode/till/internal/store"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -24,19 +25,22 @@ type paymentReq struct {
 // up to the payable is checked once the basket is priced under lock.
 func parseTenders(in []paymentReq) ([]checkout.Tender, string) {
 	if len(in) > 3 {
-		return nil, "payments can have at most one cash, one wallet and one transfer tender"
+		return nil, "payments can have at most one cash, one wallet and one awaited tender"
 	}
 	seen := map[string]bool{}
 	out := make([]checkout.Tender, 0, len(in))
 	for _, p := range in {
 		m := strings.ToLower(strings.TrimSpace(p.Method))
-		if m != "cash" && m != "wallet" && m != "transfer" {
-			return nil, "payment method must be cash, wallet, or transfer"
+		kind := m
+		if payments.Awaited(m) {
+			kind = "awaited"
+		} else if m != "cash" && m != "wallet" {
+			return nil, "payment method must be cash, wallet, " + strings.Join(payments.AwaitedMethods, ", ")
 		}
-		if seen[m] {
-			return nil, "each payment method can appear only once"
+		if seen[kind] {
+			return nil, "payments can have at most one cash, one wallet and one awaited tender"
 		}
-		seen[m] = true
+		seen[kind] = true
 		amt, err := money.ParseJSONAmount(p.AmountMinor)
 		if err != nil {
 			return nil, "each payment needs a positive integer amount_minor"

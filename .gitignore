@@ -14,9 +14,7 @@
 *.swp
 .DS_Store
 .superpowers/
-coverage.out
 /tilld
-/tilld.exe
 .gotmp/
 .claude/worktrees/
 /brag-output*/

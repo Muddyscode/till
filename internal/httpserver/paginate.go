@@ -10,7 +10,7 @@ import (
 	"github.com/google/uuid"
 )
 
-// Cursor-paginated list handlers for orders, journals/transfers and audit.
+// Cursor-paginated list handlers for orders, journals and audit.
 // Responses carry next_cursor (null on the last page); pass it back as ?cursor=.
 
 var lagos = time.FixedZone("WAT", 3600) // Nigeria has no daylight saving
@@ -83,7 +83,7 @@ func (s *Server) listOrdersPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if f.Status = strings.TrimSpace(q.Get("status")); f.Status != "" && !store.ValidOrderStatus(f.Status) {
-		badQuery(w, "status must be pending_payment, paid, expired, or refunded")
+		badQuery(w, "status must be pending_payment, paid, partially_refunded, refunded, expired, or voided")
 		return
 	}
 	f.Reference = strings.TrimSpace(q.Get("reference"))
@@ -127,27 +127,21 @@ func (s *Server) listOrdersPage(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"orders": out, "next_cursor": nextCursorValue(next)})
 }
 
-func (s *Server) listJournalsPaged(twoLegged bool) http.HandlerFunc {
-	key := "journals"
-	if twoLegged {
-		key = "transfers"
+func (s *Server) listJournals(w http.ResponseWriter, r *http.Request) {
+	cur, ok := cursorParam(w, r)
+	if !ok {
+		return
 	}
-	return func(w http.ResponseWriter, r *http.Request) {
-		cur, ok := cursorParam(w, r)
-		if !ok {
-			return
-		}
-		js, next, err := s.store.ListJournalsPage(r.Context(), s.store.Pool, s.staff(r).MerchantID, cur, limitParam(r, 50, 200), twoLegged)
-		if err != nil {
-			s.internalError(w, r, err)
-			return
-		}
-		out := make([]journalJSON, 0, len(js))
-		for _, j := range js {
-			out = append(out, jJSON(j))
-		}
-		writeJSON(w, http.StatusOK, map[string]any{key: out, "next_cursor": nextCursorValue(next)})
+	js, next, err := s.store.ListJournalsPage(r.Context(), s.store.Pool, s.staff(r).MerchantID, cur, limitParam(r, 50, 200))
+	if err != nil {
+		s.internalError(w, r, err)
+		return
 	}
+	out := make([]journalJSON, 0, len(js))
+	for _, j := range js {
+		out = append(out, jJSON(j))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"journals": out, "next_cursor": nextCursorValue(next)})
 }
 
 func (s *Server) listAuditPage(w http.ResponseWriter, r *http.Request) {

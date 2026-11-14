@@ -15,7 +15,12 @@ import (
 )
 
 func unmatchedBody(u store.Unmatched) map[string]any {
+	var details any
+	if len(u.Details) > 0 {
+		details = json.RawMessage(u.Details)
+	}
 	return map[string]any{
+		"connection_id": u.ConnectionID, "details": details,
 		"id": u.ID, "order_id": u.OrderID, "outlet_id": u.OutletID, "provider": u.Provider,
 		"event_id": u.EventID, "amount_minor": u.AmountMinor, "currency": u.Currency,
 		"reason": u.Reason, "status": u.Status, "created_at": u.CreatedAt,
@@ -63,7 +68,7 @@ func (s *Server) listUnmatched(w http.ResponseWriter, r *http.Request) {
 
 // unmatchedAction runs one resolution step on an unmatched payment under an
 // Idempotency-Key. act runs inside the transaction with the row locked.
-func (s *Server) unmatchedAction(w http.ResponseWriter, r *http.Request, act func(tx pgx.Tx, merchant store.Merchant, u store.Unmatched, actor store.Staff) (map[string]any, *uuid.UUID, error)) {
+func (s *Server) unmatchedAction(w http.ResponseWriter, r *http.Request, act func(tx pgx.Tx, merchant store.Merchant, u store.Unmatched, actor store.Staff, orderID *uuid.UUID) (map[string]any, *uuid.UUID, error)) {
 	key, ok := requireIdempotencyKey(w, r)
 	if !ok {
 		return
@@ -79,9 +84,22 @@ func (s *Server) unmatchedAction(w http.ResponseWriter, r *http.Request, act fun
 	if len(raw) == 0 {
 		raw = []byte(`{}`)
 	}
-	if err := decodeStrict(raw, &struct{}{}); err != nil {
+	// order_id is only used by apply: the order this payment is for.
+	var in struct {
+		OrderID string `json:"order_id"`
+	}
+	if err := decodeStrict(raw, &in); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_json", "invalid JSON")
 		return
+	}
+	var orderID *uuid.UUID
+	if v := strings.TrimSpace(in.OrderID); v != "" {
+		oid, err := uuid.Parse(v)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, ledger.CodeInvalidOrder, "order_id is invalid")
+			return
+		}
+		orderID = &oid
 	}
 	actor := s.staff(r)
 	existing, err := s.store.GetUnmatched(r.Context(), s.store.Pool, actor.MerchantID, id)
@@ -106,7 +124,7 @@ func (s *Server) unmatchedAction(w http.ResponseWriter, r *http.Request, act fun
 		if err != nil {
 			return 0, nil, nil, err
 		}
-		body, journalID, err := act(tx, merchant, u, actor)
+		body, journalID, err := act(tx, merchant, u, actor, orderID)
 		if err != nil {
 			return 0, nil, nil, err
 		}
@@ -127,16 +145,29 @@ func (s *Server) reloadUnmatched(r *http.Request, tx pgx.Tx, merchantID, id uuid
 }
 
 func (s *Server) applyUnmatched(w http.ResponseWriter, r *http.Request) {
-	s.unmatchedAction(w, r, func(tx pgx.Tx, merchant store.Merchant, u store.Unmatched, actor store.Staff) (map[string]any, *uuid.UUID, error) {
+	s.unmatchedAction(w, r, func(tx pgx.Tx, merchant store.Merchant, u store.Unmatched, actor store.Staff, orderID *uuid.UUID) (map[string]any, *uuid.UUID, error) {
 		if u.Status != "open" {
 			return nil, nil, ledger.Err("unmatched_not_open", "unmatched payment is not open")
 		}
-		if u.OrderID == nil {
-			return nil, nil, ledger.Err(checkout.CodeUnmatchedNotApplicable, "payment has no order to apply to")
+		// The order the payment was matched to, unless the caller names another.
+		if orderID == nil {
+			orderID = u.OrderID
 		}
-		order, err := s.store.LockOrder(r.Context(), tx, merchant.ID, *u.OrderID)
+		if orderID == nil {
+			return nil, nil, ledger.Err(checkout.CodeUnmatchedNotApplicable, "payment has no order to apply to; send order_id")
+		}
+		order, err := s.store.LockOrder(r.Context(), tx, merchant.ID, *orderID)
 		if err != nil {
 			return nil, nil, err
+		}
+		if actor.Role != auth.RoleAdmin {
+			ok, err := s.store.StaffHasOutlet(r.Context(), tx, actor.ID, order.OutletID, merchant.ID)
+			if err != nil {
+				return nil, nil, err
+			}
+			if !ok {
+				return nil, nil, ledger.Err(ledger.CodeForbidden, "you are not assigned to that order's outlet")
+			}
 		}
 		outlet, err := s.store.GetOutlet(r.Context(), tx, merchant.ID, order.OutletID)
 		if err != nil {
@@ -156,7 +187,7 @@ func (s *Server) applyUnmatched(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) refundUnmatched(w http.ResponseWriter, r *http.Request) {
-	s.unmatchedAction(w, r, func(tx pgx.Tx, merchant store.Merchant, u store.Unmatched, actor store.Staff) (map[string]any, *uuid.UUID, error) {
+	s.unmatchedAction(w, r, func(tx pgx.Tx, merchant store.Merchant, u store.Unmatched, actor store.Staff, _ *uuid.UUID) (map[string]any, *uuid.UUID, error) {
 		if u.Status != "open" {
 			return nil, nil, ledger.Err("unmatched_not_open", "unmatched payment is not open")
 		}
@@ -169,7 +200,7 @@ func (s *Server) refundUnmatched(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) settleUnmatched(w http.ResponseWriter, r *http.Request) {
-	s.unmatchedAction(w, r, func(tx pgx.Tx, merchant store.Merchant, u store.Unmatched, actor store.Staff) (map[string]any, *uuid.UUID, error) {
+	s.unmatchedAction(w, r, func(tx pgx.Tx, merchant store.Merchant, u store.Unmatched, actor store.Staff, _ *uuid.UUID) (map[string]any, *uuid.UUID, error) {
 		if u.Status != "refund_pending" {
 			return nil, nil, ledger.Err("unmatched_not_refund_pending", "payment is not waiting for a refund payout")
 		}

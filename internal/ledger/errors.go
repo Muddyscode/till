@@ -24,7 +24,6 @@ const (
 	CodeIdempotencyConflict   = "idempotency_conflict"
 	CodeIdempotencyInProgress = "idempotency_in_progress"
 	CodeClosedAccount         = "closed_account"
-	CodePairNotAllowed        = "pair_not_allowed"
 	CodeInvalidAmount         = "invalid_amount"
 	CodeCurrencyMismatch      = "currency_mismatch"
 	CodeUnauthorized          = "unauthorized"

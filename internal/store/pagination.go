@@ -60,7 +60,9 @@ type OrderFilter struct {
 	From, To   *time.Time // created_at >= From, created_at < To
 }
 
-var orderStatuses = map[string]bool{"pending_payment": true, "paid": true, "expired": true, "refunded": true}
+var orderStatuses = map[string]bool{
+	"pending_payment": true, "paid": true, "expired": true, "refunded": true, "partially_refunded": true, "voided": true,
+}
 
 func ValidOrderStatus(s string) bool { return orderStatuses[s] }
 
@@ -107,19 +109,15 @@ func (s *Store) ListOrdersPage(ctx context.Context, db DBTX, merchantID uuid.UUI
 	return out, next, err
 }
 
-// ListJournalsPage is ListJournals with keyset pagination. twoLeggedOnly keeps transfers.
-func (s *Store) ListJournalsPage(ctx context.Context, db DBTX, merchantID uuid.UUID, cur *Cursor, limit int, twoLeggedOnly bool) ([]ledger.Journal, *Cursor, error) {
+// ListJournalsPage returns up to limit journals, newest first, with keyset pagination.
+func (s *Store) ListJournalsPage(ctx context.Context, db DBTX, merchantID uuid.UUID, cur *Cursor, limit int) ([]ledger.Journal, *Cursor, error) {
 	ct, ci := cursorArgs(cur)
-	q := `
+	rows, err := db.Query(ctx, `
 		SELECT j.id, j.merchant_id, j.status, j.description, COALESCE(j.idempotency_key, ''), j.reverses_journal_id, j.created_at
 		FROM journals j
 		WHERE j.merchant_id = $1
-		  AND ($2::timestamptz IS NULL OR (j.created_at, j.id) < ($2::timestamptz, $3::uuid))`
-	if twoLeggedOnly {
-		q += ` AND (SELECT COUNT(*) FROM postings p WHERE p.journal_id = j.id) = 2`
-	}
-	q += ` ORDER BY j.created_at DESC, j.id DESC LIMIT $4`
-	rows, err := db.Query(ctx, q, merchantID, ct, ci, limit+1)
+		  AND ($2::timestamptz IS NULL OR (j.created_at, j.id) < ($2::timestamptz, $3::uuid))
+		ORDER BY j.created_at DESC, j.id DESC LIMIT $4`, merchantID, ct, ci, limit+1)
 	if err != nil {
 		return nil, nil, err
 	}

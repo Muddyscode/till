@@ -9,9 +9,8 @@ import (
 func goodProd() Config {
 	return Config{
 		Env: EnvProduction, DatabaseURL: "postgres://x", HTTPAddr: ":8080",
-		JWTSecret:      strings.Repeat("k", 48),
-		PaystackSecret: "sk_live_" + strings.Repeat("a", 24),
-		TokenTTL:       time.Hour,
+		JWTSecret: strings.Repeat("k", 48),
+		TokenTTL:  time.Hour,
 	}
 }
 
@@ -20,13 +19,11 @@ func TestProductionValidation(t *testing.T) {
 		t.Fatalf("good prod config rejected: %v", err)
 	}
 	cases := map[string]func(*Config){
-		"example jwt":      func(c *Config) { c.JWTSecret = ExampleJWTSecret },
-		"example paystack": func(c *Config) { c.PaystackSecret = ExamplePaystackSecret },
-		"short jwt":        func(c *Config) { c.JWTSecret = strings.Repeat("k", 40) },
-		"short paystack":   func(c *Config) { c.PaystackSecret = strings.Repeat("p", 20) },
-		"seed":             func(c *Config) { c.Seed = true; c.SeedPassword = "long-enough-pass-1" },
-		"cors star":        func(c *Config) { c.CORSOrigins = []string{"*"} },
-		"bad env":          func(c *Config) { c.Env = "staging" },
+		"example jwt": func(c *Config) { c.JWTSecret = ExampleJWTSecret },
+		"short jwt":   func(c *Config) { c.JWTSecret = strings.Repeat("k", 40) },
+		"seed":        func(c *Config) { c.Seed = true; c.SeedPassword = "long-enough-pass-1" },
+		"cors star":   func(c *Config) { c.CORSOrigins = []string{"*"} },
+		"bad env":     func(c *Config) { c.Env = "staging" },
 	}
 	for name, mut := range cases {
 		c := goodProd()
@@ -39,7 +36,7 @@ func TestProductionValidation(t *testing.T) {
 
 func TestDevelopmentAllowsExamples(t *testing.T) {
 	c := Config{Env: EnvDevelopment, DatabaseURL: "postgres://x", JWTSecret: ExampleJWTSecret,
-		PaystackSecret: ExamplePaystackSecret, Seed: true, SeedPassword: "change-me-now-12"}
+		Seed: true, SeedPassword: "change-me-now-12"}
 	if err := c.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +45,6 @@ func TestDevelopmentAllowsExamples(t *testing.T) {
 func TestFromEnv(t *testing.T) {
 	t.Setenv("TILL_DATABASE_URL", "postgres://x")
 	t.Setenv("TILL_JWT_SECRET", ExampleJWTSecret)
-	t.Setenv("TILL_PAYSTACK_SECRET", ExamplePaystackSecret)
 	t.Setenv("TILL_ENV", "")
 	t.Setenv("TILL_TOKEN_TTL", "")
 	t.Setenv("TILL_CORS_ORIGINS", "https://a.example/, https://b.example")

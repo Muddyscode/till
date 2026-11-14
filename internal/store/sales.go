@@ -124,11 +124,11 @@ func (s *Store) OrderPayments(ctx context.Context, db DBTX, orderID uuid.UUID) (
 }
 
 // InsertTender writes one payment row with its deposit journal (held tenders).
-func (s *Store) InsertTender(ctx context.Context, tx pgx.Tx, p Payment, provider string, journalID *uuid.UUID) error {
+func (s *Store) InsertTender(ctx context.Context, tx pgx.Tx, p Payment, journalID *uuid.UUID) error {
 	_, err := tx.Exec(ctx, `
-		INSERT INTO payments (id, order_id, method, status, amount_minor, provider, journal_id, deposit_journal_id)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-	`, p.ID, p.OrderID, p.Method, p.Status, p.AmountMinor, provider, journalID, p.DepositJournalID)
+		INSERT INTO payments (id, order_id, method, status, amount_minor, journal_id, deposit_journal_id)
+		VALUES ($1,$2,$3,$4,$5,$6,$7)
+	`, p.ID, p.OrderID, p.Method, p.Status, p.AmountMinor, journalID, p.DepositJournalID)
 	return err
 }
 
@@ -149,11 +149,12 @@ func (s *Store) HeldPayments(ctx context.Context, tx pgx.Tx, orderID uuid.UUID) 
 	return out, rows.Err()
 }
 
-// PendingTransferMinor is the transfer amount still owed on an order.
-func (s *Store) PendingTransferMinor(ctx context.Context, db DBTX, orderID uuid.UUID) (int64, bool, error) {
+// PendingAwaitedMinor is the amount an order is still waiting for from a
+// payment connection.
+func (s *Store) PendingAwaitedMinor(ctx context.Context, db DBTX, orderID uuid.UUID) (int64, bool, error) {
 	var n int64
 	err := db.QueryRow(ctx, `
-		SELECT amount_minor FROM payments WHERE order_id = $1 AND method = 'transfer' AND status = 'pending'
+		SELECT amount_minor FROM payments WHERE order_id = $1 AND status = 'pending'
 	`, orderID).Scan(&n)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, false, nil
@@ -192,16 +193,6 @@ func (s *Store) SetLineCosts(ctx context.Context, tx pgx.Tx, lines []OrderLine) 
 		}
 	}
 	return nil
-}
-
-// MarkAllRefunded marks every unit and tender of an order as refunded (the
-// whole-order reversal path).
-func (s *Store) MarkAllRefunded(ctx context.Context, tx pgx.Tx, orderID uuid.UUID) error {
-	if _, err := tx.Exec(ctx, `UPDATE order_lines SET refunded_qty = qty WHERE order_id = $1`, orderID); err != nil {
-		return err
-	}
-	_, err := tx.Exec(ctx, `UPDATE payments SET refunded_minor = amount_minor WHERE order_id = $1 AND status = 'confirmed'`, orderID)
-	return err
 }
 
 func (s *Store) AddLineRefundedQty(ctx context.Context, tx pgx.Tx, lineID uuid.UUID, qty int) error {
@@ -344,7 +335,7 @@ type DailySales struct {
 const saleStatuses = `('paid', 'partially_refunded', 'refunded')`
 
 func (s *Store) DailySales(ctx context.Context, db DBTX, outletID uuid.UUID, day string) (DailySales, error) {
-	ds := DailySales{Tenders: map[string]int64{"cash": 0, "transfer": 0, "wallet": 0}}
+	ds := DailySales{Tenders: map[string]int64{}}
 	err := db.QueryRow(ctx, `
 		SELECT COUNT(*), COALESCE(SUM(total_minor),0), COALESCE(SUM(vat_minor),0), COALESCE(SUM(net_minor),0),
 		       COALESCE(SUM(discount_minor),0)

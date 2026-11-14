@@ -30,6 +30,12 @@ func Run(ctx context.Context, st *store.Store, spec Spec, log *slog.Logger) erro
 	})
 }
 
+// Signing secrets of the seeded demo connections (development only).
+const (
+	DemoTillSecret     = "dev-till-secret-change-me"
+	DemoPaystackSecret = "dev-paystack-secret-change-me"
+)
+
 func run(ctx context.Context, st *store.Store, spec Spec, log *slog.Logger) error {
 	if _, err := st.GetStaffByEmail(ctx, st.Pool, adminEmail); err == nil {
 		log.Info("seed already present", "email", adminEmail)
@@ -59,6 +65,20 @@ func run(ctx context.Context, st *store.Store, spec Spec, log *slog.Logger) erro
 		sul, err := makeOutlet(ctx, tx, st, merchant.ID, "Surulere", "SUL")
 		if err != nil {
 			return err
+		}
+		// Two demo payment connections. Their secrets are development values:
+		// production refuses to seed at all.
+		for _, c := range []store.Connection{
+			{Code: "POS", Name: "Ikeja card and tap terminal", Provider: "till", Secret: DemoTillSecret, OutletID: &ikeja.ID},
+			{Code: "PSTK", Name: "Paystack", Provider: "paystack", Secret: DemoPaystackSecret},
+		} {
+			if c.ID, err = uuid.NewV7(); err != nil {
+				return err
+			}
+			c.MerchantID = merchant.ID
+			if _, err := st.CreateConnection(ctx, tx, c, nil); err != nil {
+				return err
+			}
 		}
 		if err := addStaff(ctx, tx, st, merchant.ID, adminEmail, hash, auth.RoleAdmin, nil); err != nil {
 			return err
@@ -110,11 +130,7 @@ func run(ctx context.Context, st *store.Store, spec Spec, log *slog.Logger) erro
 		if merchant.EquityAccountID == nil || merchant.InventoryAccountID == nil {
 			return fmt.Errorf("seed: books are missing")
 		}
-		poster := ledger.StorePoster{
-			LockAccounts: st.LockAccounts, InsertJournal: st.InsertJournal,
-			InsertPosting: st.InsertPosting, UpdateBalance: st.UpdateBalance,
-		}
-		_, err = ledger.Post(ctx, tx, poster, ledger.PostRequest{
+		_, err = ledger.Post(ctx, tx, st.Poster(), ledger.PostRequest{
 			MerchantID:  merchant.ID,
 			Description: "opening float and inventory",
 			Lines: []ledger.Line{

@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/Muddyscode/till/internal/checkout"
-	"github.com/Muddyscode/till/internal/httpserver"
+	"github.com/Muddyscode/till/internal/payments"
 	"github.com/Muddyscode/till/internal/store"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -39,12 +39,43 @@ func nextEvent() int64 {
 	return eventSeq
 }
 
+const testPaystackSecret = "test-paystack-secret"
+
+// connection creates a payment connection with the admin client and returns its id.
+func (c *apiClient) connection(code, provider, secret, outlet string) (id string, out map[string]any) {
+	c.t.Helper()
+	body := map[string]any{"code": code, "name": code + " test", "provider": provider}
+	if secret != "" {
+		body["secret"] = secret
+	}
+	if outlet != "" {
+		body["outlet_id"] = outlet
+	}
+	res := c.do(http.MethodPost, "/v1/payment-connections", body, nil)
+	decode(c.t, res, &out)
+	if res.StatusCode != http.StatusCreated {
+		c.t.Fatalf("connection %s: %d %v", code, res.StatusCode, out)
+	}
+	return out["id"].(string), out
+}
+
+// paystackConn returns this merchant's Paystack connection (code PSTK, clearing
+// account 1100-PSTK), creating it on first use. c must be an admin client.
+func (c *apiClient) paystackConn() string {
+	c.t.Helper()
+	if c.pstk == "" {
+		c.pstk, _ = c.connection("PSTK", "paystack", testPaystackSecret, "")
+	}
+	return c.pstk
+}
+
+// webhook delivers a signed Paystack charge.success for this merchant.
 func (c *apiClient) webhook(id int64, ref string, amount int64, currency string) (*http.Response, map[string]any) {
 	c.t.Helper()
 	body := fmt.Sprintf(`{"event":"charge.success","data":{"id":%d,"reference":%q,"amount":%d,"currency":%q,"status":"success"}}`, id, ref, amount, currency)
 	h := http.Header{}
-	h.Set("x-paystack-signature", httpserver.SignPaystack("test-paystack-secret", []byte(body)))
-	res := c.doRaw(http.MethodPost, "/v1/webhooks/paystack", body, h)
+	h.Set("x-paystack-signature", payments.SignPaystackLegacy(testPaystackSecret, []byte(body)))
+	res := c.doRaw(http.MethodPost, "/v1/webhooks/"+c.paystackConn(), body, h)
 	var out map[string]any
 	decode(c.t, res, &out)
 	return res, out
@@ -236,6 +267,7 @@ func TestConcurrentDuplicateWebhookPostsOnce(t *testing.T) {
 	sh, ord := transferShop(t, 5, 1)
 	ev := nextEvent()
 	ref := ord["reference"].(string)
+	sh.admin.paystackConn() // create it once, before the goroutines race
 	var wg sync.WaitGroup
 	statuses := make([]int, 6)
 	for i := range statuses {
@@ -252,7 +284,7 @@ func TestConcurrentDuplicateWebhookPostsOnce(t *testing.T) {
 			t.Fatalf("statuses %v", statuses)
 		}
 	}
-	if got := sh.bal("1100"); got != 100_000 {
+	if got := sh.bal("1100-PSTK"); got != 100_000 {
 		t.Fatalf("clearing %d", got)
 	}
 	if n := len(sh.admin.listUnmatched(sh.ikeja, "")); n != 0 {
@@ -261,21 +293,19 @@ func TestConcurrentDuplicateWebhookPostsOnce(t *testing.T) {
 	sh.mustHold()
 }
 
-func TestUnknownReferenceIsRecordedWithoutJournal(t *testing.T) {
+// Money that matches no order still belongs to the merchant whose connection
+// received it, so it is booked to suspense for a manager, never dropped.
+func TestUnknownReferenceGoesToSuspense(t *testing.T) {
 	sh := openShop(t, 0)
 	ev := nextEvent()
 	res, out := sh.admin.webhook(ev, "NOPE-"+uuid.NewString()[:6], 5_000, "NGN")
-	if res.StatusCode != 200 || out["reason"] != "unknown_reference" {
+	if res.StatusCode != 200 || out["status"] != "unmatched" || out["reason"] != "no_matching_order" {
 		t.Fatalf("%d %v", res.StatusCode, out)
 	}
-	var outcome string
-	var merchant *string
-	if err := testPool.QueryRow(context.Background(), `SELECT outcome, merchant_id::text FROM provider_events WHERE provider='paystack' AND event_id=$1`, fmt.Sprint(ev)).Scan(&outcome, &merchant); err != nil {
-		t.Fatal(err)
+	if sh.bal("2300") != 5_000 || sh.bal("1100-PSTK") != 5_000 {
+		t.Fatalf("suspense %d clearing %d", sh.bal("2300"), sh.bal("1100-PSTK"))
 	}
-	if outcome != "unknown_reference" || merchant != nil {
-		t.Fatalf("outcome %q merchant %v", outcome, merchant)
-	}
+	sh.mustHold()
 }
 
 // ---- 3. late / mismatched money ----
@@ -289,8 +319,8 @@ func TestLatePaymentGoesToSuspenseAndCanBeApplied(t *testing.T) {
 	if res.StatusCode != 200 || out["status"] != "unmatched" || out["reason"] != "order_expired" {
 		t.Fatalf("late webhook %d %v", res.StatusCode, out)
 	}
-	if sh.bal("2300") != 100_000 || sh.bal("1100") != 100_000 {
-		t.Fatalf("suspense %d clearing %d", sh.bal("2300"), sh.bal("1100"))
+	if sh.bal("2300") != 100_000 || sh.bal("1100-PSTK") != 100_000 {
+		t.Fatalf("suspense %d clearing %d", sh.bal("2300"), sh.bal("1100-PSTK"))
 	}
 	sh.mustHold()
 	open := sh.admin.listUnmatched(sh.ikeja, "open")
@@ -312,8 +342,8 @@ func TestLatePaymentGoesToSuspenseAndCanBeApplied(t *testing.T) {
 	if res.StatusCode != 200 || out["status"] != "applied" {
 		t.Fatalf("apply %d %v", res.StatusCode, out)
 	}
-	if sh.bal("2300") != 0 || sh.bal("1100") != 100_000 {
-		t.Fatalf("after apply suspense %d clearing %d", sh.bal("2300"), sh.bal("1100"))
+	if sh.bal("2300") != 0 || sh.bal("1100-PSTK") != 100_000 {
+		t.Fatalf("after apply suspense %d clearing %d", sh.bal("2300"), sh.bal("1100-PSTK"))
 	}
 	if sh.admin.stockAvailable(sh.ikeja, "SERUM") != 2 {
 		t.Fatalf("stock %d", sh.admin.stockAvailable(sh.ikeja, "SERUM"))
@@ -493,7 +523,8 @@ func TestControlAccountsRefuseFreeFormPostings(t *testing.T) {
 		t.Fatalf("topup %d %v", r.StatusCode, o)
 	}
 	cash, _ := sh.admin.accountByCode("1000-IKJ")
-	for _, code := range []string{"1100", "1200", "2100", "2150", "2200", "2300", "2310", "5000"} {
+	sh.admin.paystackConn()
+	for _, code := range []string{"1100", "1100-PSTK", "1200", "2100", "2150", "2200", "2300", "2310", "5000"} {
 		id, _ := sh.admin.accountByCode(code)
 		res, out := sh.admin.postJournal("j-"+uuid.NewString(), map[string]any{
 			"description": "sneaky",
@@ -507,7 +538,7 @@ func TestControlAccountsRefuseFreeFormPostings(t *testing.T) {
 		}
 	}
 	wallet, _ := sh.admin.accountByCode("2200")
-	res, out := sh.admin.postTransfer("t-"+uuid.NewString(), wallet, cash, 100, "drain wallet")
+	res, out := sh.admin.postPair("t-"+uuid.NewString(), wallet, cash, 100, "drain wallet")
 	if res.StatusCode != 409 || errCode(out) != "control_account" {
 		t.Fatalf("transfer %d %v", res.StatusCode, out)
 	}
@@ -690,8 +721,8 @@ func TestTransferRefundCreditsRefundsPayableUntilSettled(t *testing.T) {
 	if res.StatusCode != 201 || out["refund_record_id"] == nil {
 		t.Fatalf("refund %d %v", res.StatusCode, out)
 	}
-	if sh.bal("2310") != 100_000 || sh.bal("1100") != 100_000 {
-		t.Fatalf("2310 %d 1100 %d", sh.bal("2310"), sh.bal("1100"))
+	if sh.bal("2310") != 100_000 || sh.bal("1100-PSTK") != 100_000 {
+		t.Fatalf("2310 %d 1100 %d", sh.bal("2310"), sh.bal("1100-PSTK"))
 	}
 	sh.mustHold()
 	pend := sh.admin.listUnmatched(sh.ikeja, "refund_pending")
@@ -702,8 +733,8 @@ func TestTransferRefundCreditsRefundsPayableUntilSettled(t *testing.T) {
 	if res.StatusCode != 200 || o2["status"] != "refunded" {
 		t.Fatalf("settle %d %v", res.StatusCode, o2)
 	}
-	if sh.bal("2310") != 0 || sh.bal("1100") != 0 {
-		t.Fatalf("after settle 2310 %d 1100 %d", sh.bal("2310"), sh.bal("1100"))
+	if sh.bal("2310") != 0 || sh.bal("1100-PSTK") != 0 {
+		t.Fatalf("after settle 2310 %d 1100 %d", sh.bal("2310"), sh.bal("1100-PSTK"))
 	}
 	sh.mustHold()
 }

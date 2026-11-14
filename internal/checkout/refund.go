@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Muddyscode/till/internal/ledger"
+	"github.com/Muddyscode/till/internal/payments"
 	"github.com/Muddyscode/till/internal/store"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -29,35 +30,7 @@ type RefundInput struct {
 	RefundTo string       // cash, wallet or transfer; empty = see allocateRefund
 }
 
-// RefundOrder refunds a paid or partly refunded order, in whole or by line.
-//
-// A first refund of everything on a single-tender order reverses the sale
-// journal exactly (Refund, Phase 1). Every other refund is a journal of its
-// own built from the line amounts stored at sale time:
-//
-//	Dr sales (net) / Dr VAT payable / Cr tender accounts, plus Dr inventory / Cr COGS
-//
-// Units are restocked and cost returns at the cost recorded on the line. Each
-// refund adds an order_refunds row. The order is partially_refunded until every
-// unit is back, then refunded.
-func RefundOrder(ctx context.Context, tx pgx.Tx, st *store.Store, in RefundInput) (store.Order, store.OrderRefund, error) {
-	o := in.Order
-	if (o.Status != "paid" && o.Status != "partially_refunded") || o.JournalID == nil {
-		return store.Order{}, store.OrderRefund{}, ledger.Err(ledger.CodeInvalidOrder, "only a paid order can be refunded")
-	}
-	legacy := o.Status == "paid" && o.RefundedMinor == 0 && o.PaymentMethod != "split" &&
-		len(in.Lines) == 0 && (in.RefundTo == "" || in.RefundTo == o.PaymentMethod)
-	if legacy {
-		done, err := Refund(ctx, tx, st, in.Merchant, o, in.StaffID, in.IdemKey, in.Reason)
-		if err != nil {
-			return store.Order{}, store.OrderRefund{}, err
-		}
-		return finishRefund(ctx, tx, st, o, done.RefundRecordID)
-	}
-	return refundByLines(ctx, tx, st, in)
-}
-
-// finishRefund reloads the order and its newest refund after either path.
+// finishRefund reloads the order and its newest refund.
 func finishRefund(ctx context.Context, tx pgx.Tx, st *store.Store, o store.Order, recordID *uuid.UUID) (store.Order, store.OrderRefund, error) {
 	fresh, err := st.GetOrder(ctx, tx, o.MerchantID, o.ID)
 	if err != nil {
@@ -71,43 +44,6 @@ func finishRefund(ctx context.Context, tx pgx.Tx, st *store.Store, o store.Order
 	return fresh, list[len(list)-1], nil
 }
 
-// recordFullRefund is the bookkeeping for a legacy whole-order reversal: lines
-// and tenders are marked refunded and an order_refunds row is written.
-func recordFullRefund(ctx context.Context, tx pgx.Tx, st *store.Store, o store.Order, journalID, staffID uuid.UUID, reason string, at time.Time) error {
-	if err := st.MarkAllRefunded(ctx, tx, o.ID); err != nil {
-		return err
-	}
-	type lineOut struct {
-		ProductID uuid.UUID `json:"product_id"`
-		SKU       string    `json:"sku"`
-		Quantity  int       `json:"quantity"`
-		Net       int64     `json:"net_minor"`
-		VAT       int64     `json:"vat_minor"`
-		Cost      int64     `json:"cost_minor"`
-	}
-	lines := make([]lineOut, 0, len(o.Lines))
-	for _, ln := range o.Lines {
-		lines = append(lines, lineOut{ln.ProductID, ln.SKU, ln.Qty, ln.NetMinor, ln.VATMinor, ln.CostMinor})
-	}
-	rawLines, err := json.Marshal(lines)
-	if err != nil {
-		return err
-	}
-	rawTenders, err := json.Marshal(map[string]int64{o.PaymentMethod: o.TotalMinor})
-	if err != nil {
-		return err
-	}
-	id, err := newID()
-	if err != nil {
-		return err
-	}
-	return st.InsertOrderRefund(ctx, tx, store.OrderRefund{
-		ID: id, MerchantID: o.MerchantID, OrderID: o.ID, OutletID: o.OutletID, JournalID: &journalID,
-		AmountMinor: o.TotalMinor, NetMinor: o.NetMinor, VATMinor: o.VATMinor, CostMinor: o.CostMinor,
-		Lines: rawLines, Tenders: rawTenders, Reason: reason, StaffID: staffID, CreatedAt: at,
-	})
-}
-
 type pick struct {
 	ln                   store.OrderLine
 	qty                  int
@@ -119,8 +55,22 @@ type share struct {
 	amt int64
 }
 
-func refundByLines(ctx context.Context, tx pgx.Tx, st *store.Store, in RefundInput) (store.Order, store.OrderRefund, error) {
+// RefundOrder refunds a paid or partly refunded order, in whole or by line.
+// Every refund is a journal of its own built from the line amounts stored at
+// sale time:
+//
+//	Dr sales (net) / Dr VAT payable / Cr tender accounts, plus Dr inventory / Cr COGS
+//
+// A tender that came through a payment connection is credited to Refunds payable (2310) and a
+// refund_pending record is opened, settled later through
+// POST /v1/unmatched-payments/{id}/refunded. Units are restocked and cost
+// returns at the cost recorded on the line. Each refund adds an order_refunds
+// row. The order is partially_refunded until every unit is back, then refunded.
+func RefundOrder(ctx context.Context, tx pgx.Tx, st *store.Store, in RefundInput) (store.Order, store.OrderRefund, error) {
 	o, m := in.Order, in.Merchant
+	if (o.Status != "paid" && o.Status != "partially_refunded") || o.JournalID == nil {
+		return store.Order{}, store.OrderRefund{}, ledger.Err(ledger.CodeInvalidOrder, "only a paid order can be refunded")
+	}
 	picks, err := pickLines(o, in.Lines)
 	if err != nil {
 		return store.Order{}, store.OrderRefund{}, err
@@ -158,10 +108,10 @@ func refundByLines(ctx context.Context, tx pgx.Tx, st *store.Store, in RefundInp
 	}
 	var walletShare, transferShare int64
 	for _, s := range shares {
-		switch s.pay.Method {
-		case "wallet":
+		switch {
+		case s.pay.Method == "wallet":
 			walletShare = s.amt
-		case "transfer":
+		case payments.Awaited(s.pay.Method):
 			transferShare = s.amt
 		}
 	}
@@ -192,10 +142,11 @@ func refundByLines(ctx context.Context, tx pgx.Tx, st *store.Store, in RefundInp
 		}
 		tenders[s.pay.Method] = s.amt
 		acct := outlet.CashAccountID
-		switch s.pay.Method {
-		case "wallet":
+		switch {
+		case s.pay.Method == "wallet":
 			acct = *m.WalletAccountID
-		case "transfer":
+		case payments.Awaited(s.pay.Method):
+			// The money came through a provider, so it has to go back that way.
 			acct = *m.RefundsPayableID
 		}
 		jl = append(jl, ledger.Line{AccountID: acct, Direction: ledger.Credit, Amount: s.amt})
@@ -206,7 +157,7 @@ func refundByLines(ctx context.Context, tx pgx.Tx, st *store.Store, in RefundInp
 			ledger.Line{AccountID: *m.COGSAccountID, Direction: ledger.Credit, Amount: cost},
 		)
 	}
-	j, err := ledger.Post(ctx, tx, poster(st), ledger.PostRequest{
+	j, err := ledger.Post(ctx, tx, st.Poster(), ledger.PostRequest{
 		MerchantID:     m.ID,
 		Description:    "refund " + o.Reference,
 		Lines:          jl,
@@ -266,9 +217,15 @@ func refundByLines(ctx context.Context, tx pgx.Tx, st *store.Store, in RefundInp
 			return store.Order{}, store.OrderRefund{}, err
 		}
 		oid, outletID := o.ID, o.OutletID
+		var connID *uuid.UUID
+		if cid, ok, err := st.OrderConnection(ctx, tx, o.ID); err != nil {
+			return store.Order{}, store.OrderRefund{}, err
+		} else if ok {
+			connID = &cid
+		}
 		if err := st.InsertUnmatched(ctx, tx, store.Unmatched{
-			ID: rid, MerchantID: m.ID, OrderID: &oid, OutletID: &outletID,
-			Provider: "paystack", EventID: "refund:" + refundID.String(),
+			ID: rid, MerchantID: m.ID, OrderID: &oid, OutletID: &outletID, ConnectionID: connID,
+			Provider: "refund", EventID: "refund:" + refundID.String(),
 			AmountMinor: transferShare, Currency: "NGN", Reason: "order_refund",
 			Status: "refund_pending", CreatedAt: now, ResolvedAt: &now, ResolvedBy: &in.StaffID, JournalID: &j.ID,
 		}); err != nil {

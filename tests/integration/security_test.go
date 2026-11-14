@@ -30,9 +30,8 @@ func uniquePhone() string {
 func startAPICfg(t *testing.T, mutate func(*config.Config)) (*apiClient, *httpserver.Server) {
 	t.Helper()
 	cfg := config.Config{
-		JWTSecret:      "test-secret-must-be-32-bytes-ok!",
-		PaystackSecret: "test-paystack-secret",
-		HoldMinutes:    15,
+		JWTSecret:   "test-secret-must-be-32-bytes-ok!",
+		HoldMinutes: 15,
 	}
 	if mutate != nil {
 		mutate(&cfg)
@@ -90,7 +89,7 @@ func (sh *shop) newStaff(role, outlet string) (string, string) {
 func TestLoginLockoutAfterTenFailures(t *testing.T) {
 	sh := openShop(t, 0)
 	email, id := sh.newStaff("cashier", sh.ikeja)
-	c, _ := startAPICfg(t, func(cfg *config.Config) { cfg.LoginRatePerIP = 1000 })
+	c, _ := startAPICfg(t, func(cfg *config.Config) { cfg.LoginRatePerIP, cfg.LoginRatePerEmail = 1000, 1000 })
 
 	for i := 0; i < 10; i++ {
 		res, body := c.login(email, "wrong-password-xx")
@@ -129,7 +128,8 @@ func TestLoginLockoutAfterTenFailures(t *testing.T) {
 func TestLoginFailuresOutsideWindowDoNotLock(t *testing.T) {
 	sh := openShop(t, 0)
 	email, id := sh.newStaff("cashier", sh.ikeja)
-	c, _ := startAPICfg(t, nil)
+	// High rate limits: this test is about the lockout counter, not the limiter.
+	c, _ := startAPICfg(t, func(cfg *config.Config) { cfg.LoginRatePerIP, cfg.LoginRatePerEmail = 1000, 1000 })
 	for i := 0; i < 5; i++ {
 		c.login(email, "wrong-password-xx")
 	}
@@ -624,7 +624,7 @@ func TestHTTPHygiene(t *testing.T) {
 		t.Fatalf("cache-control: %q", res.Header.Get("Cache-Control"))
 	}
 	h.Set("X-Request-ID", "bad id with spaces\t")
-	res = sh.admin.do(http.MethodGet, "/v1/health", nil, h)
+	res = sh.admin.do(http.MethodGet, "/livez", nil, h)
 	decode(t, res, nil)
 	if id := res.Header.Get("X-Request-ID"); id == "" || strings.Contains(id, " ") {
 		t.Fatalf("generated id: %q", id)
@@ -679,9 +679,6 @@ func TestLivenessReadinessAndSweeperHeartbeat(t *testing.T) {
 	c, api := startAPICfg(t, nil)
 	if got := c.status(http.MethodGet, "/livez", nil); got != 200 {
 		t.Fatalf("livez %d", got)
-	}
-	if got := c.status(http.MethodGet, "/v1/health", nil); got != 200 {
-		t.Fatalf("health %d", got)
 	}
 	if got := c.status(http.MethodGet, "/readyz", nil); got != 200 {
 		t.Fatalf("readyz without sweeper check: %d", got)

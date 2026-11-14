@@ -2,7 +2,6 @@ package ledger
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -30,23 +29,6 @@ func Post(ctx context.Context, tx pgx.Tx, st StorePoster, req PostRequest) (Jour
 	byID := map[uuid.UUID]Account{}
 	for _, a := range accts {
 		byID[a.ID] = a
-	}
-
-	if req.EnforceTransferPairs {
-		if len(req.Lines) != 2 {
-			return Journal{}, Err(CodeInvalidJournal, "transfers must have exactly two postings")
-		}
-		var debitType, creditType AccountType
-		for _, l := range req.Lines {
-			if l.Direction == Debit {
-				debitType = byID[l.AccountID].Type
-			} else {
-				creditType = byID[l.AccountID].Type
-			}
-		}
-		if !TransferPairAllowed(debitType, creditType) {
-			return Journal{}, Err(CodePairNotAllowed, fmt.Sprintf("transfer debit %s / credit %s is not allowed", debitType, creditType))
-		}
 	}
 
 	newBal := map[uuid.UUID]int64{}

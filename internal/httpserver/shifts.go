@@ -18,18 +18,6 @@ import (
 // "require an open shift to sell" is future work; enforcing it needs a hook in
 // the sale path, which Phase 3B deliberately leaves untouched.
 
-// opsError is writeLedgerError plus the conflict codes Phase 3B adds.
-func opsError(w http.ResponseWriter, err error) {
-	if le := ledger.AsError(err); le != nil {
-		switch le.Code {
-		case "shift_already_open", "transfer_not_in_transit":
-			writeError(w, http.StatusConflict, le.Code, le.Message)
-			return
-		}
-	}
-	writeLedgerError(w, err)
-}
-
 func shiftBody(sh store.Shift) map[string]any {
 	return map[string]any{
 		"id": sh.ID, "outlet_id": sh.OutletID, "staff_id": sh.StaffID, "status": sh.Status,
@@ -83,7 +71,7 @@ func (s *Server) openShift(w http.ResponseWriter, r *http.Request) {
 		})
 	})
 	if err != nil {
-		opsError(w, err)
+		writeLedgerError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, shiftBody(sh))
@@ -135,7 +123,7 @@ func (s *Server) getShift(w http.ResponseWriter, r *http.Request) {
 	}
 	sh, err := s.store.GetShift(r.Context(), s.store.Pool, s.staff(r).MerchantID, id)
 	if err != nil {
-		opsError(w, err)
+		writeLedgerError(w, err)
 		return
 	}
 	if _, ok := s.canSeeShift(w, r, sh); !ok {
@@ -151,7 +139,7 @@ func (s *Server) shiftZReport(w http.ResponseWriter, r *http.Request) {
 	}
 	sh, err := s.store.GetShift(r.Context(), s.store.Pool, s.staff(r).MerchantID, id)
 	if err != nil {
-		opsError(w, err)
+		writeLedgerError(w, err)
 		return
 	}
 	outlet, ok := s.canSeeShift(w, r, sh)
@@ -202,7 +190,7 @@ func (s *Server) closeShift(w http.ResponseWriter, r *http.Request) {
 	actor := s.staff(r)
 	sh, err := s.store.GetShift(r.Context(), s.store.Pool, actor.MerchantID, id)
 	if err != nil {
-		opsError(w, err)
+		writeLedgerError(w, err)
 		return
 	}
 	// A cashier closes only their own shift; managers and admins may close anyone's.
@@ -222,7 +210,7 @@ func (s *Server) closeShift(w http.ResponseWriter, r *http.Request) {
 		return err
 	})
 	if err != nil {
-		opsError(w, err)
+		writeLedgerError(w, err)
 		return
 	}
 	body := shiftBody(closed)

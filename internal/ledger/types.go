@@ -42,8 +42,7 @@ func (d Direction) Valid() bool {
 type AccountStatus string
 
 const (
-	AccountOpen   AccountStatus = "open"
-	AccountClosed AccountStatus = "closed"
+	AccountOpen AccountStatus = "open"
 )
 
 type Account struct {
@@ -86,12 +85,11 @@ type Journal struct {
 }
 
 type PostRequest struct {
-	MerchantID           uuid.UUID
-	Description          string
-	Lines                []Line
-	ReversesJournalID    *uuid.UUID
-	EnforceTransferPairs bool
-	IdempotencyKey       string
+	MerchantID        uuid.UUID
+	Description       string
+	Lines             []Line
+	ReversesJournalID *uuid.UUID
+	IdempotencyKey    string
 }
 
 func NaturalDelta(t AccountType, d Direction, amount int64) int64 {

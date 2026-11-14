@@ -53,7 +53,7 @@ func returnDeposits(ctx context.Context, tx pgx.Tx, st *store.Store, o store.Ord
 		}
 	}
 	lines := append([]ledger.Line{{AccountID: dep, Direction: ledger.Debit, Amount: total}}, credits...)
-	j, err := ledger.Post(ctx, tx, poster(st), ledger.PostRequest{
+	j, err := ledger.Post(ctx, tx, st.Poster(), ledger.PostRequest{
 		MerchantID:     o.MerchantID,
 		Description:    "deposits returned " + o.Reference,
 		Lines:          lines,

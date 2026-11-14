@@ -6,7 +6,8 @@ info:
     POS ledger and inventory API for one merchant with many outlets.
     Money is integer kobo (NGN). Stock quantities are integers.
     A cash sale deducts stock and posts a balanced journal in one Postgres transaction.
-    A transfer reserves stock until a signed Paystack-style webhook posts the sale.
+    A transfer, card, tap, USSD, QR or mobile money sale reserves stock until a signed payment event from a payment connection posts the sale.
+    Payments are provider-neutral: Paystack, Flutterwave, Monnify and the standard `till` format are adapters behind POST /v1/webhooks/{connection_id}.
     A wallet sale spends store credit held as a liability of this merchant. It is not a licensed e-money wallet.
     Average cost, cost of goods, and an order-level discount are part of that same transaction.
     There is no public registration. Staff log in with a role of admin, manager, or cashier.
@@ -15,7 +16,6 @@ servers:
   - url: http://127.0.0.1:8080
 
 tags:
-  - name: Health
   - name: Auth
   - name: Outlets
   - name: Products
@@ -24,6 +24,7 @@ tags:
   - name: Orders
   - name: Merchant
   - name: Payments
+  - name: Payment connections
   - name: Unmatched payments
   - name: Reports
   - name: Audit
@@ -36,24 +37,6 @@ tags:
   - name: Suppliers
 
 paths:
-  /v1/health:
-    get:
-      tags: [Health]
-      summary: Liveness and database ping
-      operationId: health
-      responses:
-        "200":
-          description: Database is reachable
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [status]
-                properties:
-                  status: { type: string, example: ok }
-        "503":
-          $ref: "#/components/responses/Error"
-
   /v1/auth/login:
     post:
       tags: [Auth]
@@ -181,7 +164,7 @@ paths:
     post:
       tags: [Products]
       summary: Create a product
-      description: Admin or manager. price_minor is integer kobo. Unknown fields are rejected.
+      description: Admin only (a manager gets 403, because a new product sets a price). price_minor is integer kobo. Unknown fields are rejected.
       operationId: createProduct
       security: [{ bearerAuth: [] }]
       requestBody:
@@ -198,6 +181,7 @@ paths:
                 price_minor: { type: integer, minimum: 1, example: 850000 }
                 avg_cost_minor: { type: integer, minimum: 0, description: Opening average cost in kobo. Omit or 0 leaves the layer at zero until a receipt sets it. }
                 reorder_level: { type: integer, minimum: 0 }
+                tax_class: { type: string, enum: [standard, exempt, zero], default: standard, description: Only standard lines carry VAT. }
       responses:
         "201":
           description: Product created
@@ -217,7 +201,7 @@ paths:
       tags: [Products]
       summary: Change name, price, average cost, reorder level, or active flag
       description: |
-        Admin or manager. A price change writes audit action product.price_changed.
+        Admin or manager. Only an admin may send price_minor, avg_cost_minor or tax_class (a manager gets 403). A price change writes audit action product.price_changed.
         Changing avg_cost_minor while units are on hand posts the difference to inventory (1200)
         and inventory adjustment (5200). An increase credits 5200, which is allowed to go negative.
         That journal is not a cash transfer. A refund does not recompute the average.
@@ -239,6 +223,7 @@ paths:
                 price_minor: { type: integer, minimum: 1 }
                 avg_cost_minor: { type: integer, minimum: 0 }
                 reorder_level: { type: integer, minimum: 0 }
+                tax_class: { type: string, enum: [standard, exempt, zero] }
                 active: { type: boolean }
       responses:
         "200":
@@ -290,6 +275,7 @@ paths:
                 unit_cost_minor: { type: integer, minimum: 0, description: Omit to keep the current average. Explicit 0 is allowed. }
                 delta: { type: integer, description: Not used on a receipt. }
                 reason: { type: string }
+                supplier_id: { type: string, format: uuid, description: Links the receipt to a supplier. Receipts only. }
       responses:
         "200":
           description: New on_hand
@@ -458,7 +444,7 @@ paths:
         - $ref: "#/components/parameters/outletId"
         - $ref: "#/components/parameters/limit"
         - $ref: "#/components/parameters/cursor"
-        - { in: query, name: status, schema: { type: string, enum: [pending_payment, paid, expired, refunded] } }
+        - { in: query, name: status, schema: { type: string, enum: [pending_payment, paid, partially_refunded, refunded, expired, voided] } }
         - { in: query, name: reference, schema: { type: string } }
         - { in: query, name: customer_id, schema: { type: string, format: uuid } }
         - { in: query, name: from, description: "RFC 3339 or YYYY-MM-DD (Lagos time). created_at >= from.", schema: { type: string } }
@@ -481,7 +467,8 @@ paths:
       description: |
         Requires Idempotency-Key.
         Cash deducts on_hand and posts the sale journal. Response 201, status paid.
-        Transfer increments reserved, status pending_payment, and posts nothing.
+        An awaited method (transfer, card, tap, ussd, qr, mobile_money) increments reserved, sets status pending_payment, and posts nothing.
+        Only a payment event on a payment connection pays it. See POST /v1/webhooks/{connection_id}.
         Wallet requires customer_id, spends store credit, and posts in the same transaction. The balance cannot go negative (409 insufficient_wallet).
         discount_minor is optional integer kobo. Omit it or send 0 for no discount. It must be less than the shelf total. VAT is calculated on the amount the customer pays. The client cannot send a price.
         When the average cost is above zero, the sale journal also debits cost of goods (5000) and credits inventory (1200). A discount does not reduce that cost.
@@ -501,21 +488,21 @@ paths:
               description: Give either payment_method or payments (split tender), not both.
               properties:
                 outlet_id: { type: string, format: uuid }
-                payment_method: { type: string, enum: [cash, transfer, wallet] }
+                payment_method: { type: string, enum: [cash, wallet, transfer, card, tap, ussd, qr, mobile_money] }
                 payments:
                   type: array
                   minItems: 1
                   maxItems: 3
                   description: |
-                    Split tender, at most one tender per method, amounts adding up to the payable (else 400 tender_mismatch).
-                    Cash and wallet only posts at once. With a transfer tender the order is pending_payment, cash and wallet
-                    are held in Deposits held 2400, and the webhook must be for the transfer amount only.
+                    Split tender: at most one cash, one wallet and one awaited tender, amounts adding up to the payable (else 400 tender_mismatch).
+                    Cash and wallet only posts at once. With an awaited tender (transfer, card, tap, ussd, qr, mobile_money) the order is
+                    pending_payment, cash and wallet are held in Deposits held 2400, and the payment event must be for the awaited amount only.
                   items:
                     type: object
                     required: [method, amount_minor]
                     additionalProperties: false
                     properties:
-                      method: { type: string, enum: [cash, wallet, transfer] }
+                      method: { type: string, enum: [cash, wallet, transfer, card, tap, ussd, qr, mobile_money] }
                       amount_minor: { type: integer, minimum: 1 }
                       customer_id: { type: string, format: uuid, description: Required on the wallet tender only }
                 discount_reason: { type: string, maxLength: 200, description: Required when discount_minor > 0 (400 discount_reason_required). Over the role limit is 403 discount_limit. }
@@ -587,11 +574,11 @@ paths:
         Optional lines (product_id or sku, quantity) refund part of the order; no lines refunds everything left. Repeatable until
         refunded: status goes paid, partially_refunded, refunded. Discount and VAT are apportioned to lines at sale time. More units
         than are left is 409 refund_exceeds_order. refund_to (cash, wallet, transfer) sends all of it to one tender that still has
-        enough; without it the money goes back to the original tender, pro rata across a split order. The response adds refund.
+        enough (any of the order's methods); without it the money goes back to the original tender, pro rata across a split order. The response adds refund.
         Admin or manager. Restocks and reverses the sale journal in one transaction. A wallet sale also puts the paid amount back on the customer balance. The average cost is not recomputed.
         Requires Idempotency-Key. Body may be empty, {} or an object with an optional reason.
         The order records refund_journal_id, refunded_at, refunded_by and refund_reason.
-        A transfer (Paystack) sale credits Refunds payable 2310 instead of clearing 1100 and returns refund_record_id,
+        An awaited-method sale (transfer, card, tap and so on) credits Refunds payable 2310 instead of clearing and returns refund_record_id,
         an unmatched payment in refund_pending. Close it with POST /v1/unmatched-payments/{id}/refunded once the money has left the provider.
         If an account would go negative the answer is 409 refund_insufficient_funds, naming the account.
       operationId: refundOrder
@@ -608,7 +595,7 @@ paths:
               additionalProperties: false
               properties:
                 reason: { type: string, maxLength: 200 }
-                refund_to: { type: string, enum: [cash, wallet, transfer] }
+                refund_to: { type: string, enum: [cash, wallet, transfer, card, tap, ussd, qr, mobile_money] }
                 lines:
                   type: array
                   items:
@@ -639,7 +626,7 @@ paths:
       description: |
         Cashier at the outlet, manager or admin. Requires Idempotency-Key. Only a pending_payment order: the reservation is
         released, held cash and wallet tenders are returned, status becomes voided and order.voided is audited.
-        A webhook arriving later goes to unmatched payments with reason order_voided.
+        A payment arriving later goes to unmatched payments with reason order_voided.
       operationId: voidOrder
       security: [{ bearerAuth: [] }]
       parameters:
@@ -701,48 +688,60 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/MerchantSettings" }
 
-  /v1/webhooks/paystack:
+  /v1/webhooks/{connection_id}:
     post:
       tags: [Payments]
-      summary: Mock Paystack charge.success
+      summary: Receive a payment event from a provider
       description: |
-        No bearer token. Header x-paystack-signature is hex HMAC-SHA512 of the raw body
-        using TILL_PAYSTACK_SECRET. Amount is integer kobo.
-        Only event charge.success can post a sale.
-        Bad signature is 401 and changes nothing.
-        Every signature-valid charge.success is recorded once in provider_events (provider, event id);
-        a repeat of the same id replays the stored response with Idempotent-Replayed true and posts nothing.
-        A reference that matches no order returns 200 status ignored, reason unknown_reference (event and audit row only).
-        A reference that matches an order but cannot be applied (order_expired, order_already_paid, order_refunded,
-        amount_mismatch, currency_mismatch) returns 200 status unmatched: Dr 1100 Paystack clearing / Cr 2300 Payment suspense
-        and an open unmatched payment. See /v1/unmatched-payments.
-      operationId: paystackWebhook
+        No bearer token. The connection in the path picks the merchant, the provider adapter and the signing secret
+        before the body is trusted. An unknown, disabled or badly signed request is always 401 and changes nothing.
+
+        Adapters and the header each one verifies:
+        - paystack: Paystack-Signature "t=<unix>,v1=<key id>:<hex>" (HMAC-SHA512 of "t.body", 5 minute tolerance),
+          or the older x-paystack-signature (HMAC-SHA512 of the body). Amounts are kobo. Only charge.success is a payment.
+        - till: Till-Signature "t=<unix>,v1=<hex HMAC-SHA256 of t.body>" (5 minute tolerance). Body is TillPayment.
+        - flutterwave: verif-hash equal to the shared secret. charge.completed. Amounts are naira. Not checked against live
+          documentation: confirm with a sandbox webhook before go-live.
+        - monnify: monnify-signature (HMAC-SHA512 of the body). SUCCESSFUL_TRANSACTION. Amounts are naira. Not checked against
+          live documentation: confirm with a sandbox webhook before go-live.
+
+        Every payment takes one path. The event is recorded once per connection and event id; a repeat replays the first answer
+        with Idempotent-Replayed true and posts nothing. The order is found by reference inside the merchant. With no usable reference,
+        the single pending order waiting for exactly that amount is paid (at the connection's outlet when it has one); two candidates
+        are not guessed. A payment that fits pays the order and the response is the Order. Anything that cannot be applied
+        (no_matching_order, ambiguous_amount, order_expired, order_voided, order_already_paid, order_refunded, currency_mismatch,
+        amount_mismatch) is posted Dr 1100-CODE clearing / Cr 2300 Payment suspense and opened as an unmatched payment: 200 with
+        status unmatched. fee_minor is posted Dr 5100 Payment fees / Cr 1100-CODE. Status failed is ignored. Status reversed is only
+        written to the audit log (payment.reversed) and posts nothing: chargeback handling is not built.
+      operationId: paymentWebhook
       parameters:
-        - in: header
-          name: x-paystack-signature
+        - in: path
+          name: connection_id
           required: true
-          schema: { type: string }
+          schema: { type: string, format: uuid }
+        - { in: header, name: Till-Signature, required: false, description: "Used by provider till.", schema: { type: string } }
+        - { in: header, name: Paystack-Signature, required: false, description: "Used by provider paystack.", schema: { type: string } }
+        - { in: header, name: x-paystack-signature, required: false, description: "Older Paystack header.", schema: { type: string } }
+        - { in: header, name: verif-hash, required: false, description: "Used by provider flutterwave.", schema: { type: string } }
+        - { in: header, name: monnify-signature, required: false, description: "Used by provider monnify.", schema: { type: string } }
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              type: object
-              required: [event, data]
-              properties:
-                event: { type: string, example: charge.success }
-                data:
-                  type: object
-                  required: [id, reference, amount, currency, status]
-                  properties:
-                    id: { type: integer, minimum: 1, description: Paystack event id. Replay of the same id is idempotent. }
-                    reference: { type: string }
-                    amount: { type: integer, description: Kobo. Must equal the order total. }
-                    currency: { type: string, example: NGN }
-                    status: { type: string, example: success }
+              oneOf:
+                - $ref: "#/components/schemas/TillPayment"
+                - type: object
+                  description: The provider's own notification body.
+                  additionalProperties: true
+            example:
+              id: tap-1001
+              reference: IKJ-A1B2C3D4-000002
+              amount_minor: 120000
+              method: tap
       responses:
         "200":
-          description: Paid order, an unmatched payment, or an ignored event
+          description: Paid order, an unmatched payment, an ignored event, or the stored answer to a repeated event
           headers:
             Idempotent-Replayed: { $ref: "#/components/headers/IdempotentReplayed" }
           content:
@@ -753,10 +752,185 @@ paths:
                   - type: object
                     properties:
                       status: { type: string, enum: [ignored, unmatched, duplicate] }
-                      reason: { type: string, example: order_expired }
+                      reason: { type: string, example: ambiguous_amount }
                       unmatched_payment_id: { type: string, format: uuid }
+        "400":
+          description: invalid_payment (the body is not a valid payment) or invalid_json
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "401":
-          description: invalid signature
+          description: Unknown, disabled or badly signed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/payment-connections:
+    get:
+      tags: [Payment connections]
+      summary: List payment connections
+      description: Admin or manager. balance_minor is the connection's clearing account 1100-CODE, what the provider still holds for the merchant. The secret is never returned.
+      operationId: listPaymentConnections
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: Connections, oldest first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  payment_connections:
+                    type: array
+                    items: { $ref: "#/components/schemas/PaymentConnection" }
+    post:
+      tags: [Payment connections]
+      summary: Create a payment connection
+      description: |
+        Admin only. A connection is one place the merchant receives non-cash money: a Paystack account, a Moniepoint or Monnify
+        account, a card or tap terminal, a bank account watched by a feed. Creating one also creates its clearing account 1100-CODE.
+        secret is the provider's webhook signing secret (16 to 200 characters) and is required, except for provider till, where it is
+        generated and returned once in this response.
+      operationId: createPaymentConnection
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code, name, provider]
+              additionalProperties: false
+              properties:
+                code: { type: string, pattern: "^[A-Z0-9]{2,8}$", example: MONIE, description: Unique per merchant. Lower case is upper-cased. }
+                name: { type: string, maxLength: 80, example: Moniepoint terminal }
+                provider: { type: string, enum: [till, paystack, flutterwave, monnify] }
+                secret: { type: string, minLength: 16, maxLength: 200, description: Required except for provider till. }
+                outlet_id: { type: string, format: uuid, description: Optional. Money with no reference is looked for at this outlet. }
+                account_number: { type: string, maxLength: 40, description: Optional. The account customers pay into. }
+      responses:
+        "201":
+          description: The connection. secret is present only when Till generated it.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PaymentConnection" }
+        "400":
+          description: invalid_connection
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: connection_code_taken
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/Error"
+        "404":
+          description: outlet_id is not in this merchant
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/payment-connections/{id}:
+    delete:
+      tags: [Payment connections]
+      summary: Disable a payment connection
+      description: Admin only. A disabled connection answers 401 to every webhook and rejects manual payments. Its history and clearing balance stay.
+      operationId: disablePaymentConnection
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/id"
+      responses:
+        "204":
+          description: Disabled
+        "404":
+          $ref: "#/components/responses/Error"
+
+  /v1/payment-connections/{id}/settlements:
+    post:
+      tags: [Payment connections]
+      summary: Record a provider payout to the bank
+      description: Admin only. Requires Idempotency-Key. Posts Dr 1050 Bank / Cr 1100-CODE clearing. 1050 is created on first use.
+      operationId: createPaymentSettlement
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/id"
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [amount_minor]
+              additionalProperties: false
+              properties:
+                amount_minor: { type: integer, minimum: 1 }
+                reference: { type: string, maxLength: 100, description: The provider's payout reference. }
+      responses:
+        "201":
+          description: The settlement
+          headers:
+            Idempotent-Replayed: { $ref: "#/components/headers/IdempotentReplayed" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Settlement" }
+        "400":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          description: idempotency_conflict or idempotency_in_progress
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/payment-connections/{id}/payments:
+    post:
+      tags: [Payment connections]
+      summary: Record a payment by hand
+      description: |
+        Admin or manager, or an API key with the manager role. A cashier gets 403. Same body as the till format, with no signature.
+        For money Till cannot hear about by webhook: a transfer checked in the bank app, a terminal that is not integrated.
+        The staff member is on the audit trail. It takes the same path as a webhook: deduplicated once per connection and event id,
+        matched to an order by reference or by amount, or opened as an unmatched payment. This replaces a "mark paid" button: it needs
+        a manager and a provider event id. Unknown fields are rejected.
+      operationId: recordPayment
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/id"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TillPayment" }
+      responses:
+        "200":
+          description: Paid order, an unmatched payment, an ignored event, or the stored answer to a repeated event
+          headers:
+            Idempotent-Replayed: { $ref: "#/components/headers/IdempotentReplayed" }
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/Order"
+                  - type: object
+                    properties:
+                      status: { type: string, enum: [ignored, unmatched, duplicate] }
+                      reason: { type: string, example: ambiguous_amount }
+                      unmatched_payment_id: { type: string, format: uuid }
+        "400":
+          description: invalid_payment or invalid_json
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          description: connection_inactive
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -765,7 +939,7 @@ paths:
     get:
       tags: [Unmatched payments]
       summary: List payments that could not be applied
-      description: Admin or manager. Managers must pass outlet_id for an outlet they are assigned to. Includes refunded transfer sales (reason order_refund).
+      description: Admin or manager. Managers must pass outlet_id for an outlet they are assigned to. Includes money that matched no order and refunded awaited-method sales (reason order_refund).
       operationId: listUnmatchedPayments
       security: [{ bearerAuth: [] }]
       parameters:
@@ -793,16 +967,27 @@ paths:
   /v1/unmatched-payments/{id}/apply:
     post:
       tags: [Unmatched payments]
-      summary: Apply an open payment to its (expired) order
+      summary: Apply an open payment to a pending or expired order
       description: |
-        Admin or manager. Requires Idempotency-Key. Works only when the order is expired, the payment is NGN,
-        the amount equals the order total and the stock is available again. Re-runs the sale posting with Dr 2300 Payment suspense
-        instead of clearing. Otherwise 409 unmatched_not_applicable or insufficient_stock.
+        Admin or manager. Requires Idempotency-Key. The order is the one named by order_id, or else the order the payment was matched to.
+        A pending order takes the payment when the amount equals what the order is waiting for. An expired order takes it when the
+        amount equals the order total and the stock is available again. The payment must be NGN. Re-runs the sale posting with
+        Dr 2300 Payment suspense instead of clearing. Otherwise 409 unmatched_not_applicable or insufficient_stock.
+        A non-admin must be assigned to that order's outlet (else 403). A payment with no outlet can only be resolved by an admin.
       operationId: applyUnmatchedPayment
       security: [{ bearerAuth: [] }]
       parameters:
         - $ref: "#/components/parameters/id"
         - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                order_id: { type: string, format: uuid, description: "Needed when the payment has no order yet (reasons no_matching_order and ambiguous_amount). Otherwise optional." }
       responses:
         "200":
           description: The payment (status applied) with the paid order under order
@@ -843,7 +1028,7 @@ paths:
     post:
       tags: [Unmatched payments]
       summary: Record that a queued refund was paid out
-      description: Admin or manager. Requires Idempotency-Key. Status becomes refunded. Posts Dr 2310 Refunds payable / Cr 1100 Paystack clearing. Also closes the refund of a transfer sale.
+      description: Admin or manager. Requires Idempotency-Key. Status becomes refunded. Posts Dr 2310 Refunds payable / Cr the clearing account (1100-CODE) of the connection the money came in on. Also closes the refund of an awaited-method sale.
       operationId: settleUnmatchedRefund
       security: [{ bearerAuth: [] }]
       parameters:
@@ -1133,92 +1318,11 @@ paths:
                 type: object
                 additionalProperties: true
 
-  /v1/accounts/{id}/close:
-    post:
-      tags: [Ledger]
-      summary: Close an account
-      description: Admin only. A closed account rejects new postings.
-      operationId: closeAccount
-      security: [{ bearerAuth: [] }]
-      parameters:
-        - $ref: "#/components/parameters/id"
-      responses:
-        "200":
-          description: Closed
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Account" }
-
-  /v1/transfers:
-    post:
-      tags: [Ledger]
-      summary: Two-legged transfer
-      description: Admin only. Requires Idempotency-Key. Income cannot be the debit side except through a reversal. A line on a system account (1100, 1200, 2100, 2150, 2200, 2300, 2310, 5000) is 409 control_account.
-      operationId: postTransfer
-      security: [{ bearerAuth: [] }]
-      parameters:
-        - $ref: "#/components/parameters/idempotencyKey"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [debit_account_id, credit_account_id, amount_minor]
-              properties:
-                debit_account_id: { type: string, format: uuid }
-                credit_account_id: { type: string, format: uuid }
-                amount_minor: { type: integer, minimum: 1 }
-                description: { type: string }
-      responses:
-        "201":
-          description: Posted journal
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Journal" }
-        "409":
-          $ref: "#/components/responses/Error"
-    get:
-      tags: [Ledger]
-      summary: List transfers
-      operationId: listTransfers
-      security: [{ bearerAuth: [] }]
-      parameters:
-        - $ref: "#/components/parameters/limit"
-        - $ref: "#/components/parameters/cursor"
-      responses:
-        "200":
-          description: Journals that are transfers
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  transfers:
-                    type: array
-                    items: { $ref: "#/components/schemas/Journal" }
-                  next_cursor: { $ref: "#/components/schemas/NextCursor" }
-
-  /v1/transfers/{id}:
-    get:
-      tags: [Ledger]
-      summary: Get a transfer journal
-      operationId: getTransfer
-      security: [{ bearerAuth: [] }]
-      parameters:
-        - $ref: "#/components/parameters/id"
-      responses:
-        "200":
-          description: Journal
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Journal" }
-
   /v1/journals:
     post:
       tags: [Ledger]
       summary: Post a balanced journal
-      description: Admin only. Requires Idempotency-Key. 2 to 20 postings. Each account at most once. Debits must equal credits. A line on a system account (1100, 1200, 2100, 2150, 2200, 2300, 2310, 5000) is 409 control_account.
+      description: Admin only. Requires Idempotency-Key. 2 to 20 postings. Each account at most once. Debits must equal credits. Unknown fields are rejected. A line on a system account (1100, any 1100-CODE clearing account, 1200, 2100, 2150, 2200, 2300, 2310, 2400, 5000) is 409 control_account. 1050 Bank is not a system account, so an opening balance can be posted to it.
       operationId: postJournal
       security: [{ bearerAuth: [] }]
       parameters:
@@ -1230,6 +1334,7 @@ paths:
             schema:
               type: object
               required: [postings]
+              additionalProperties: false
               properties:
                 description: { type: string }
                 postings:
@@ -1283,7 +1388,7 @@ paths:
     post:
       tags: [Ledger]
       summary: Reverse a journal by appending
-      description: Admin only. Requires Idempotency-Key. Does not update the original rows. A journal attached to an order returns 409 refund_via_order. A reversal that would touch a system account is 409 control_account.
+      description: Admin only. Requires Idempotency-Key. Does not update the original rows. A journal attached to an order returns 409 refund_via_order. A reversal that would touch a system account (including any 1100-CODE clearing account) is 409 control_account.
       operationId: reverseJournal
       security: [{ bearerAuth: [] }]
       parameters:
@@ -1467,7 +1572,7 @@ paths:
         "404":
           $ref: "#/components/responses/Error"
 
-  # ---- Phase 3B: shop operations ----
+  # ---- shop operations ----
   /v1/shifts/open:
     post:
       tags: [Shifts]
@@ -1747,8 +1852,8 @@ paths:
           $ref: "#/components/responses/Error"
     get:
       tags: [Stock]
-      summary: List transfers
-      operationId: listTransfers
+      summary: List stock transfers
+      operationId: listStockTransfers
       security: [{ bearerAuth: [] }]
       parameters:
         - { in: query, name: status, schema: { type: string, enum: [in_transit, received, cancelled] } }
@@ -1768,8 +1873,8 @@ paths:
   /v1/stock/transfers/{id}:
     get:
       tags: [Stock]
-      summary: One transfer
-      operationId: getTransfer
+      summary: One stock transfer
+      operationId: getStockTransfer
       security: [{ bearerAuth: [] }]
       parameters:
         - $ref: "#/components/parameters/id"
@@ -1994,7 +2099,7 @@ paths:
       summary: Pay a supplier
       description: |
         Manager or admin. Posts Dr 2150 Goods received / Cr outlet cash (method cash) or
-        Cr 1100 clearing (method bank). A payment the cash or clearing account cannot cover is rejected.
+        Cr 1050 Bank (method bank). A payment the cash or bank account cannot cover is rejected.
       operationId: createSupplierPayment
       security: [{ bearerAuth: [] }]
       parameters:
@@ -2270,7 +2375,7 @@ components:
         id: { type: string, format: uuid }
         outlet_id: { type: string, format: uuid }
         status: { type: string, enum: [pending_payment, paid, expired, refunded, partially_refunded, voided] }
-        payment_method: { type: string, enum: [cash, transfer, wallet, split] }
+        payment_method: { type: string, enum: [cash, wallet, transfer, card, tap, ussd, qr, mobile_money, split] }
         payments: { type: array, items: { $ref: "#/components/schemas/Payment" } }
         discount_reason: { type: string }
         refunded_minor: { type: integer, description: Running total refunded }
@@ -2302,18 +2407,25 @@ components:
         id: { type: string, format: uuid }
         order_id: { type: string, format: uuid, nullable: true }
         outlet_id: { type: string, format: uuid, nullable: true }
+        connection_id: { type: string, format: uuid, nullable: true, description: The payment connection the money came in on. Null for rows from before connections. }
         provider: { type: string, example: paystack }
-        event_id: { type: string, description: "Provider event id, or refund:{order id} for a refunded transfer sale" }
+        event_id: { type: string, description: "Provider event id, or refund:{order id} for a refunded awaited-method sale" }
         amount_minor: { type: integer }
         currency: { type: string }
-        reason: { type: string, enum: [order_expired, order_voided, order_already_paid, order_refunded, amount_mismatch, currency_mismatch, order_refund] }
+        details:
+          type: object
+          nullable: true
+          additionalProperties: true
+          description: Who paid and how, as reported. reference, method, fee_minor, paid_at, payer_name, payer_account, payer_bank, account_number, session_id, recorded_by (the staff id, when recorded by hand).
+        reason: { type: string, enum: [no_matching_order, ambiguous_amount, order_expired, order_voided, order_already_paid, order_refunded, amount_mismatch, currency_mismatch, order_refund] }
         status: { type: string, enum: [open, applied, refund_pending, refunded] }
         created_at: { type: string, format: date-time }
         resolved_at: { type: string, format: date-time, nullable: true }
         resolved_by: { type: string, format: uuid, nullable: true }
-        journal_id: { type: string, format: uuid, nullable: true, description: "Dr 1100 / Cr 2300 on arrival (or the order reversal for order_refund)" }
+        journal_id: { type: string, format: uuid, nullable: true, description: "Dr 1100-CODE / Cr 2300 on arrival (or the order reversal for order_refund)" }
         resolution_journal_id: { type: string, format: uuid, nullable: true, description: "Sale journal (apply) or Dr 2300 / Cr 2310 (refund)" }
-        settlement_journal_id: { type: string, format: uuid, nullable: true, description: "Dr 2310 / Cr 1100" }
+        settlement_journal_id: { type: string, format: uuid, nullable: true, description: "Dr 2310 / Cr 1100-CODE" }
+        order: { $ref: "#/components/schemas/Order" }
 
     DailySales:
       type: object
@@ -2340,10 +2452,13 @@ components:
         net_sales_minor: { type: integer, description: total_minor minus refunds_minor }
         tender_totals:
           type: object
+          description: One <method>_minor key for each method used that day (card_minor, tap_minor, ussd_minor, qr_minor, mobile_money_minor). cash_minor, transfer_minor and wallet_minor are always present.
+          required: [cash_minor, transfer_minor, wallet_minor]
           properties:
             cash_minor: { type: integer }
             transfer_minor: { type: integer }
             wallet_minor: { type: integer }
+          additionalProperties: { type: integer }
         by_cashier:
           type: array
           items:
@@ -2360,6 +2475,55 @@ components:
         books_refund_credit_minor: { type: integer }
         matches_books: { type: boolean }
 
+    PaymentConnection:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        code: { type: string, example: MONIE }
+        name: { type: string }
+        provider: { type: string, enum: [till, paystack, flutterwave, monnify] }
+        active: { type: boolean }
+        outlet_id: { type: string, format: uuid, description: Present when the connection is tied to an outlet. }
+        account_number: { type: string }
+        clearing_account_id: { type: string, format: uuid }
+        balance_minor: { type: integer, description: "The clearing account 1100-CODE. What the provider still holds for the merchant, in kobo. It may be negative." }
+        webhook_path: { type: string, example: /v1/webhooks/0190a1b2-0000-7000-8000-000000000001, description: Give the provider this path on your host as the webhook URL. }
+        created_at: { type: string, format: date-time }
+        secret: { type: string, description: "Only in the create response, and only for provider till." }
+
+    TillPayment:
+      type: object
+      description: The standard payment format. Any system that knows a payment happened can post it to a connection. Amounts are integer minor units (kobo).
+      required: [id, amount_minor]
+      properties:
+        id: { type: string, maxLength: 200, description: "The sender's own id for this payment. It is the dedupe key, unique per connection." }
+        reference: { type: string, description: "The order reference, when the payer or checkout carried one." }
+        amount_minor: { type: integer, minimum: 1 }
+        fee_minor: { type: integer, minimum: 0, description: What the provider kept. Must be less than the amount. }
+        currency: { type: string, default: NGN, minLength: 3, maxLength: 3 }
+        status: { type: string, enum: [success, failed, reversed], default: success }
+        method: { type: string, enum: [transfer, card, tap, ussd, qr, mobile_money] }
+        paid_at: { type: string, format: date-time }
+        payer:
+          type: object
+          properties:
+            name: { type: string }
+            account: { type: string }
+            bank: { type: string }
+        account_number: { type: string, description: The account the money landed in. }
+        session_id: { type: string, description: The NIP session id of a bank transfer. }
+
+    Settlement:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        connection_id: { type: string, format: uuid }
+        amount_minor: { type: integer }
+        reference: { type: string }
+        journal_id: { type: string, format: uuid, description: Dr 1050 Bank / Cr 1100-CODE }
+        balance_minor: { type: integer, description: The connection's clearing balance after the payout. }
+        created_at: { type: string, format: date-time }
+
     MerchantSettings:
       type: object
       properties:
@@ -2371,7 +2535,7 @@ components:
     Payment:
       type: object
       properties:
-        method: { type: string, enum: [cash, wallet, transfer] }
+        method: { type: string, enum: [cash, wallet, transfer, card, tap, ussd, qr, mobile_money] }
         status: { type: string, enum: [pending, held, confirmed, returned] }
         amount_minor: { type: integer }
         refunded_minor: { type: integer }

@@ -302,6 +302,9 @@ func TestVoidPendingSplitReturnsDepositsAndLateWebhookIsUnmatched(t *testing.T) 
 	if got := sh.admin.getMap("/v1/orders/" + id); got["status"] != "voided" {
 		t.Fatalf("order after webhook %v", got["status"])
 	}
+	if list := sh.admin.getMap("/v1/orders?status=voided"); len(list["orders"].([]any)) != 1 {
+		t.Fatalf("voided filter %v", list)
+	}
 	sh.mustHold()
 }
 

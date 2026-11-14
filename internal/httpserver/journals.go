@@ -12,13 +12,6 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-type transferReq struct {
-	DebitAccountID  string          `json:"debit_account_id"`
-	CreditAccountID string          `json:"credit_account_id"`
-	AmountMinor     json.RawMessage `json:"amount_minor"`
-	Description     string          `json:"description"`
-}
-
 type journalLineReq struct {
 	AccountID   string          `json:"account_id"`
 	Direction   string          `json:"direction"`
@@ -36,41 +29,6 @@ type txResult struct {
 	replayed bool
 }
 
-func (s *Server) postTransfer(w http.ResponseWriter, r *http.Request) {
-	key, ok := requireIdempotencyKey(w, r)
-	if !ok {
-		return
-	}
-	raw, ok := s.readBody(w, r)
-	if !ok {
-		return
-	}
-	var in transferReq
-	if err := json.Unmarshal(raw, &in); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_json", "invalid JSON")
-		return
-	}
-	debitID, err := uuid.Parse(in.DebitAccountID)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_journal", "debit_account_id is invalid")
-		return
-	}
-	creditID, err := uuid.Parse(in.CreditAccountID)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_journal", "credit_account_id is invalid")
-		return
-	}
-	amount, err := money.ParseJSONAmount(in.AmountMinor)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, ledger.CodeInvalidAmount, err.Error())
-		return
-	}
-	s.postLines(w, r, key, fingerprint(r, raw), in.Description, []ledger.Line{
-		{AccountID: debitID, Direction: ledger.Debit, Amount: amount},
-		{AccountID: creditID, Direction: ledger.Credit, Amount: amount},
-	}, true, nil)
-}
-
 func (s *Server) postJournal(w http.ResponseWriter, r *http.Request) {
 	key, ok := requireIdempotencyKey(w, r)
 	if !ok {
@@ -81,7 +39,7 @@ func (s *Server) postJournal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in journalReq
-	if err := json.Unmarshal(raw, &in); err != nil {
+	if err := decodeStrict(raw, &in); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_json", "invalid JSON")
 		return
 	}
@@ -103,7 +61,7 @@ func (s *Server) postJournal(w http.ResponseWriter, r *http.Request) {
 			Amount:    amt,
 		})
 	}
-	s.postLines(w, r, key, fingerprint(r, raw), in.Description, lines, false, nil)
+	s.postLines(w, r, key, fingerprint(r, raw), in.Description, lines, nil)
 }
 
 func (s *Server) reverseJournal(w http.ResponseWriter, r *http.Request) {
@@ -144,10 +102,10 @@ func (s *Server) reverseJournal(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, ledger.CodeAlreadyReversed, "journal already reversed")
 		return
 	}
-	s.postLines(w, r, key, fingerprint(r, raw), "reversal of "+orig.ID.String(), ledger.ReverseLines(orig.Postings), false, &orig.ID)
+	s.postLines(w, r, key, fingerprint(r, raw), "reversal of "+orig.ID.String(), ledger.ReverseLines(orig.Postings), &orig.ID)
 }
 
-func (s *Server) postLines(w http.ResponseWriter, r *http.Request, key string, hash []byte, desc string, lines []ledger.Line, enforcePairs bool, reverses *uuid.UUID) {
+func (s *Server) postLines(w http.ResponseWriter, r *http.Request, key string, hash []byte, desc string, lines []ledger.Line, reverses *uuid.UUID) {
 	op := s.staff(r)
 	var result txResult
 	err := s.withTx(r.Context(), func(tx pgx.Tx) error {
@@ -162,13 +120,12 @@ func (s *Server) postLines(w http.ResponseWriter, r *http.Request, key string, h
 		if err := s.refuseControlAccounts(r.Context(), tx, op.MerchantID, lines); err != nil {
 			return err
 		}
-		j, err := ledger.Post(r.Context(), tx, s.poster(), ledger.PostRequest{
-			MerchantID:           op.MerchantID,
-			Description:          desc,
-			Lines:                lines,
-			ReversesJournalID:    reverses,
-			EnforceTransferPairs: enforcePairs,
-			IdempotencyKey:       key,
+		j, err := ledger.Post(r.Context(), tx, s.store.Poster(), ledger.PostRequest{
+			MerchantID:        op.MerchantID,
+			Description:       desc,
+			Lines:             lines,
+			ReversesJournalID: reverses,
+			IdempotencyKey:    key,
 		})
 		if err != nil {
 			return err
@@ -203,7 +160,7 @@ func (s *Server) postLines(w http.ResponseWriter, r *http.Request, key string, h
 	_, _ = w.Write(append(result.body, '\n'))
 }
 
-// refuseControlAccounts blocks free-form journals, transfers and raw reversals
+// refuseControlAccounts blocks free-form journals and raw reversals
 // from touching the merchant's system accounts. Those move only through the
 // flows that keep stock, wallet balances and unmatched payments in step.
 func (s *Server) refuseControlAccounts(ctx context.Context, tx pgx.Tx, merchantID uuid.UUID, lines []ledger.Line) error {
@@ -226,6 +183,13 @@ func (s *Server) refuseControlAccounts(ctx context.Context, tx pgx.Tx, merchantI
 	} else if ok {
 		control[dep] = "2400"
 	}
+	clearing, err := s.store.ClearingAccountIDs(ctx, tx, merchantID)
+	if err != nil {
+		return err
+	}
+	for id, code := range clearing {
+		control[id] = code
+	}
 	for _, l := range lines {
 		if code, ok := control[l.AccountID]; ok {
 			return ledger.Err(ledger.CodeControlAccount, "account "+code+" is a system control account and cannot be posted to directly")
@@ -245,30 +209,4 @@ func (s *Server) getJournal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, jJSON(j))
-}
-
-func (s *Server) listJournals(w http.ResponseWriter, r *http.Request) {
-	s.listJournalKind(w, r, false)
-}
-
-func (s *Server) listTransfers(w http.ResponseWriter, r *http.Request) {
-	s.listJournalKind(w, r, true)
-}
-
-func (s *Server) listJournalKind(w http.ResponseWriter, r *http.Request, twoLegged bool) {
-	limit := limitParam(r, 50, 200)
-	js, err := s.store.ListJournals(r.Context(), s.store.Pool, s.staff(r).MerchantID, limit, twoLegged)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", "internal error")
-		return
-	}
-	out := make([]journalJSON, 0, len(js))
-	for _, j := range js {
-		out = append(out, jJSON(j))
-	}
-	key := "journals"
-	if twoLegged {
-		key = "transfers"
-	}
-	writeJSON(w, http.StatusOK, map[string]any{key: out})
 }

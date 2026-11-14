@@ -1,10 +1,12 @@
 .git
 .github
 .gotmp
+.claude
 .env
 *.exe
 *.test
 *.out
 brag-output
+brag-output*
 docs/*.pdf
 tests

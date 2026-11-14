@@ -13,11 +13,7 @@ import (
 func lagosDay(raw string) (string, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		loc, err := time.LoadLocation("Africa/Lagos")
-		if err != nil {
-			return "", err
-		}
-		return time.Now().In(loc).Format("2006-01-02"), nil
+		return time.Now().In(lagos).Format("2006-01-02"), nil
 	}
 	if _, err := time.Parse("2006-01-02", raw); err != nil {
 		return "", err
@@ -75,6 +71,12 @@ func (s *Server) dailySales(w http.ResponseWriter, r *http.Request) {
 			"refund_count": c.RefundCount, "refunds_minor": c.RefundsMinor,
 		})
 	}
+	// One "<method>_minor" entry per tender method. Cash, transfer and wallet
+	// are always present.
+	tenders := map[string]any{"cash_minor": int64(0), "transfer_minor": int64(0), "wallet_minor": int64(0)}
+	for method, n := range ds.Tenders {
+		tenders[method+"_minor"] = n
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"date": day, "outlet_id": outletID,
 		"order_count": ds.OrderCount, "total_minor": ds.TotalMinor,
@@ -82,10 +84,8 @@ func (s *Server) dailySales(w http.ResponseWriter, r *http.Request) {
 		"discount_total_minor": ds.DiscountMinor,
 		"refund_count":         ds.RefundCount, "refunds_minor": ds.RefundsMinor,
 		"net_sales_minor": ds.TotalMinor - ds.RefundsMinor,
-		"tender_totals": map[string]any{
-			"cash_minor": ds.Tenders["cash"], "transfer_minor": ds.Tenders["transfer"], "wallet_minor": ds.Tenders["wallet"],
-		},
-		"by_method": methods, "by_cashier": cashiers,
+		"tender_totals":   tenders,
+		"by_method":       methods, "by_cashier": cashiers,
 		"books_debit_minor": ds.BooksDebit, "books_refund_credit_minor": ds.BooksRefundCredit,
 		"matches_books": ds.TotalMinor == ds.BooksDebit && ds.RefundsMinor == ds.BooksRefundCredit,
 	})
@@ -126,39 +126,6 @@ func (s *Server) stockReport(w http.ResponseWriter, r *http.Request, lowOnly boo
 		key = "low_stock"
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"outlet_id": outletID, key: out})
-}
-
-func (s *Server) listAudit(w http.ResponseWriter, r *http.Request) {
-	st := s.staff(r)
-	var outletID *uuid.UUID
-	if raw := strings.TrimSpace(r.URL.Query().Get("outlet_id")); raw != "" {
-		id, err := uuid.Parse(raw)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "invalid_order", "outlet_id is invalid")
-			return
-		}
-		if _, ok := s.authorizeOutlet(w, r, id); !ok {
-			return
-		}
-		outletID = &id
-	} else if st.Role != auth.RoleAdmin {
-		writeError(w, http.StatusBadRequest, "invalid_order", "outlet_id is required")
-		return
-	}
-	list, err := s.store.ListAudit(r.Context(), s.store.Pool, st.MerchantID, outletID, limitParam(r, 50, 200))
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", "internal error")
-		return
-	}
-	out := make([]map[string]any, 0, len(list))
-	for _, ev := range list {
-		out = append(out, map[string]any{
-			"id": ev.ID, "staff_id": ev.StaffID, "action": ev.Action,
-			"entity_type": ev.EntityType, "entity_id": ev.EntityID,
-			"outlet_id": ev.OutletID, "metadata": jsonRaw(ev.Metadata), "created_at": ev.CreatedAt,
-		})
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"events": out})
 }
 
 func jsonRaw(b []byte) any {

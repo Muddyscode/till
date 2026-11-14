@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/Muddyscode/till/internal/ledger"
+	"github.com/Muddyscode/till/internal/payments"
 	"github.com/Muddyscode/till/internal/store"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -13,8 +14,8 @@ import (
 
 // Tender is one way the customer pays part (or all) of an order.
 type Tender struct {
-	Method     string // cash, wallet or transfer
-	Amount     int64
+	Method     string     // cash, wallet or transfer
+	Amount     int64      // 0 on a lone tender means the whole payable (payment_method)
 	CustomerID *uuid.UUID // wallet only
 }
 
@@ -22,13 +23,13 @@ type Tender struct {
 //
 //   - Cash and wallet only: the sale posts at once, one journal with a debit
 //     per tender (outlet cash, customer wallet).
-//   - With a transfer tender: the order is held pending_payment and the stock
+//   - With an awaited tender (transfer, card, tap, ...): the order is held pending_payment and the stock
 //     reserved. Cash and wallet tenders are taken now and parked in Deposits
-//     held (2400); the Paystack webhook for the transfer amount posts the sale
-//     (Dr 2400 + Dr 1100). Expiry or void returns the deposits.
+//     held (2400); the payment event for the awaited amount posts the sale
+//     (Dr 2400 + Dr the connection clearing account). Expiry or void returns the deposits.
 //
-// One tender behaves like the matching single payment_method. Two or more make
-// the order's payment_method "split".
+// A single tender with Amount 0 is a payment_method sale. Two or more tenders
+// make the order's payment_method "split".
 func SaleWithTenders(ctx context.Context, tx pgx.Tx, st *store.Store, in SaleInput, tenders []Tender) (store.Order, error) {
 	if len(tenders) == 0 {
 		return store.Order{}, ledger.Err(ledger.CodeInvalidOrder, "payments needs at least one tender")
@@ -36,27 +37,20 @@ func SaleWithTenders(ctx context.Context, tx pgx.Tx, st *store.Store, in SaleInp
 	if in.Hold == 0 {
 		in.Hold = 15 * time.Minute
 	}
-	var cash, wallet, transfer int64
 	var customer *uuid.UUID
 	for _, t := range tenders {
-		switch t.Method {
-		case "cash":
-			cash = t.Amount
-		case "wallet":
-			wallet = t.Amount
+		if t.Method == "wallet" {
+			if t.CustomerID == nil || in.Merchant.WalletAccountID == nil {
+				return store.Order{}, ledger.Err(ledger.CodeInvalidOrder, "wallet payment needs a customer_id")
+			}
 			customer = t.CustomerID
-		case "transfer":
-			transfer = t.Amount
 		}
 	}
-	if wallet > 0 && (customer == nil || in.Merchant.WalletAccountID == nil) {
-		return store.Order{}, ledger.Err(ledger.CodeInvalidOrder, "wallet payment needs a customer_id")
-	}
-	pending := transfer > 0
 	method := "split"
 	if len(tenders) == 1 {
 		method = tenders[0].Method
 	}
+	whole := len(tenders) == 1 && tenders[0].Amount == 0
 
 	var err error
 	in.Lines, err = refreshProducts(ctx, tx, st, in.Merchant.ID, in.Lines)
@@ -70,7 +64,29 @@ func SaleWithTenders(ctx context.Context, tx pgx.Tx, st *store.Store, in SaleInp
 	if err := enforceDiscount(in.Merchant, in.Role, c.Shelf, in.DiscountMinor, in.DiscountReason); err != nil {
 		return store.Order{}, err
 	}
-	if cash+wallet+transfer != c.Payable {
+	if whole {
+		t := tenders[0]
+		t.Amount = c.Payable
+		tenders = []Tender{t}
+	}
+	// awaited is the tender a payment connection has to confirm (transfer,
+	// card, tap, USSD, QR, mobile money). An order has at most one.
+	var cash, wallet, awaited int64
+	awaitedMethod := ""
+	for _, t := range tenders {
+		switch {
+		case t.Method == "cash":
+			cash = t.Amount
+		case t.Method == "wallet":
+			wallet = t.Amount
+		case payments.Awaited(t.Method) && awaitedMethod == "":
+			awaited, awaitedMethod = t.Amount, t.Method
+		default:
+			return store.Order{}, ledger.Err(ledger.CodeInvalidOrder, "an order can have one cash, one wallet and one awaited payment")
+		}
+	}
+	pending := awaitedMethod != ""
+	if cash+wallet+awaited != c.Payable {
 		return store.Order{}, ledger.Err(CodeTenderMismatch, "payments must add up to the payable total")
 	}
 	lines := c.Lines
@@ -152,9 +168,16 @@ func SaleWithTenders(ctx context.Context, tx pgx.Tx, st *store.Store, in SaleInp
 	if wallet > 0 {
 		tenderLines = append(tenderLines, ledger.Line{AccountID: *in.Merchant.WalletAccountID, Direction: ledger.Debit, Amount: wallet})
 	}
-	meta := map[string]any{
-		"reference": ref, "total_minor": c.Payable, "discount_minor": in.DiscountMinor, "method": method,
-		"payments": map[string]int64{"cash": cash, "wallet": wallet, "transfer": transfer},
+	meta := map[string]any{"reference": ref, "total_minor": c.Payable, "discount_minor": in.DiscountMinor}
+	if !whole || !pending {
+		meta["method"] = method
+	}
+	if !whole {
+		split := map[string]int64{"cash": cash, "wallet": wallet, "transfer": 0}
+		if pending {
+			split[awaitedMethod] = awaited
+		}
+		meta["payments"] = split
 	}
 	if customer != nil {
 		meta["customer_id"] = customer.String()
@@ -175,7 +198,7 @@ func SaleWithTenders(ctx context.Context, tx pgx.Tx, st *store.Store, in SaleInp
 			if err != nil {
 				return store.Order{}, err
 			}
-			if err := st.InsertTender(ctx, tx, store.Payment{ID: pid, OrderID: id, Method: t.Method, Status: "confirmed", AmountMinor: t.Amount}, "", &j.ID); err != nil {
+			if err := st.InsertTender(ctx, tx, store.Payment{ID: pid, OrderID: id, Method: t.Method, Status: "confirmed", AmountMinor: t.Amount}, &j.ID); err != nil {
 				return store.Order{}, err
 			}
 		}
@@ -197,7 +220,7 @@ func SaleWithTenders(ctx context.Context, tx pgx.Tx, st *store.Store, in SaleInp
 		}
 		jl := append([]ledger.Line(nil), tenderLines...)
 		jl = append(jl, ledger.Line{AccountID: dep, Direction: ledger.Credit, Amount: cash + wallet})
-		dj, err := ledger.Post(ctx, tx, poster(st), ledger.PostRequest{
+		dj, err := ledger.Post(ctx, tx, st.Poster(), ledger.PostRequest{
 			MerchantID:     in.Merchant.ID,
 			Description:    "deposits held " + ref,
 			Lines:          jl,
@@ -214,11 +237,10 @@ func SaleWithTenders(ctx context.Context, tx pgx.Tx, st *store.Store, in SaleInp
 			return store.Order{}, err
 		}
 		p := store.Payment{ID: pid, OrderID: id, Method: t.Method, Status: "held", AmountMinor: t.Amount, DepositJournalID: depositJournal}
-		provider := ""
-		if t.Method == "transfer" {
-			p.Status, p.DepositJournalID, provider = "pending", nil, "paystack"
+		if t.Method == awaitedMethod {
+			p.Status, p.DepositJournalID = "pending", nil
 		}
-		if err := st.InsertTender(ctx, tx, p, provider, nil); err != nil {
+		if err := st.InsertTender(ctx, tx, p, nil); err != nil {
 			return store.Order{}, err
 		}
 	}

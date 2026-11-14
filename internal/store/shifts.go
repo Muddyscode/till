@@ -11,16 +11,6 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// Poster adapts the store for ledger.Post.
-func (s *Store) Poster() ledger.StorePoster {
-	return ledger.StorePoster{
-		LockAccounts:  s.LockAccounts,
-		InsertJournal: s.InsertJournal,
-		InsertPosting: s.InsertPosting,
-		UpdateBalance: s.UpdateBalance,
-	}
-}
-
 // EnsureAccount returns the merchant account with this code, creating it when
 // missing. Safe against two transactions creating it together.
 func (s *Store) EnsureAccount(ctx context.Context, tx pgx.Tx, merchantID uuid.UUID, code, name string, typ ledger.AccountType, allowNegative bool) (uuid.UUID, error) {
@@ -128,7 +118,7 @@ type CashFlow struct {
 	CashInMinor    int64 // every debit to the cash account
 	CashOutMinor   int64 // every credit to the cash account
 	CashSalesMinor int64 // debits from sale journals
-	RefundsMinor   int64 // credits from reversal journals
+	RefundsMinor   int64 // credits from refund journals
 	SalesCount     int
 	RefundCount    int
 }
@@ -145,7 +135,7 @@ func (s *Store) ShiftCashFlow(ctx context.Context, db DBTX, merchantID, outletID
 		  COALESCE(SUM(p.amount_minor) FILTER (WHERE p.direction = 'debit'), 0),
 		  COALESCE(SUM(p.amount_minor) FILTER (WHERE p.direction = 'credit'), 0),
 		  COALESCE(SUM(p.amount_minor) FILTER (WHERE p.direction = 'debit' AND j.reverses_journal_id IS NULL AND j.description LIKE 'sale %'), 0),
-		  COALESCE(SUM(p.amount_minor) FILTER (WHERE p.direction = 'credit' AND j.reverses_journal_id IS NOT NULL), 0)
+		  COALESCE(SUM(p.amount_minor) FILTER (WHERE p.direction = 'credit' AND j.description LIKE 'refund %'), 0)
 		FROM journals j
 		JOIN postings p ON p.journal_id = j.id AND p.account_id = $4
 		WHERE j.merchant_id = $1 AND j.created_at >= $5 AND j.created_at <= $6

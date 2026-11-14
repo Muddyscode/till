@@ -10,8 +10,7 @@ import (
 	"time"
 
 	"github.com/Muddyscode/till/internal/auth"
-	"github.com/Muddyscode/till/internal/checkout"
-	"github.com/Muddyscode/till/internal/httpserver"
+	"github.com/Muddyscode/till/internal/payments"
 	"github.com/Muddyscode/till/internal/store"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -294,14 +293,14 @@ func TestTransferReservesUntilWebhook(t *testing.T) {
 
 	body := []byte(fmt.Sprintf(`{"event":"charge.success","data":{"id":%d,"reference":%q,"amount":200000,"currency":"NGN","status":"success"}}`, nextEvent(), out["reference"]))
 	h := http.Header{}
-	h.Set("x-paystack-signature", httpserver.SignPaystack("test-paystack-secret", body))
-	paid := sh.admin.doRaw(http.MethodPost, "/v1/webhooks/paystack", string(body), h)
+	h.Set("x-paystack-signature", payments.SignPaystackLegacy(testPaystackSecret, body))
+	paid := sh.admin.doRaw(http.MethodPost, "/v1/webhooks/"+sh.admin.paystackConn(), string(body), h)
 	var paidBody map[string]any
 	decode(t, paid, &paidBody)
 	if paid.StatusCode != 200 || paidBody["status"] != "paid" {
 		t.Fatalf("webhook %d %v", paid.StatusCode, paidBody)
 	}
-	again := sh.admin.doRaw(http.MethodPost, "/v1/webhooks/paystack", string(body), h)
+	again := sh.admin.doRaw(http.MethodPost, "/v1/webhooks/"+sh.admin.paystackConn(), string(body), h)
 	var againBody map[string]any
 	decode(t, again, &againBody)
 	if again.StatusCode != 200 || againBody["id"] != paidBody["id"] {
@@ -326,7 +325,7 @@ func TestWebhookRejectsBadSignatureAndWrongAmount(t *testing.T) {
 	body := []byte(fmt.Sprintf(`{"event":"charge.success","data":{"id":%d,"reference":%q,"amount":100000,"currency":"NGN","status":"success"}}`, nextEvent(), out["reference"]))
 	h := http.Header{}
 	h.Set("x-paystack-signature", "deadbeef")
-	bad := sh.admin.doRaw(http.MethodPost, "/v1/webhooks/paystack", string(body), h)
+	bad := sh.admin.doRaw(http.MethodPost, "/v1/webhooks/"+sh.admin.paystackConn(), string(body), h)
 	if bad.StatusCode != 401 {
 		t.Fatalf("sig %d", bad.StatusCode)
 	}
@@ -336,8 +335,8 @@ func TestWebhookRejectsBadSignatureAndWrongAmount(t *testing.T) {
 	}
 	wrong := []byte(fmt.Sprintf(`{"event":"charge.success","data":{"id":%d,"reference":%q,"amount":50,"currency":"NGN","status":"success"}}`, nextEvent(), out["reference"]))
 	h2 := http.Header{}
-	h2.Set("x-paystack-signature", httpserver.SignPaystack("test-paystack-secret", wrong))
-	ig := sh.admin.doRaw(http.MethodPost, "/v1/webhooks/paystack", string(wrong), h2)
+	h2.Set("x-paystack-signature", payments.SignPaystackLegacy(testPaystackSecret, wrong))
+	ig := sh.admin.doRaw(http.MethodPost, "/v1/webhooks/"+sh.admin.paystackConn(), string(wrong), h2)
 	var igBody map[string]any
 	decode(t, ig, &igBody)
 	if ig.StatusCode != 200 || igBody["reason"] != "amount_mismatch" {
@@ -356,23 +355,7 @@ func TestReservationExpiryReleasesStock(t *testing.T) {
 	if res.StatusCode != 201 {
 		t.Fatal(out)
 	}
-	ctx := context.Background()
-	if _, err := testPool.Exec(ctx, `UPDATE orders SET expires_at = now() - interval '1 minute' WHERE id = $1`, out["id"]); err != nil {
-		t.Fatal(err)
-	}
-	st := store.New(testPool)
-	var n int
-	err := st.WithTx(ctx, func(tx pgx.Tx) error {
-		var err error
-		n, err = checkout.ReleaseExpired(ctx, tx, st, time.Now())
-		return err
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if n < 1 {
-		t.Fatalf("released %d", n)
-	}
+	sh.expireOrder(out["id"].(string))
 	got := sh.admin.do(http.MethodGet, "/v1/orders/"+out["id"].(string), nil, nil)
 	var order map[string]any
 	decode(t, got, &order)
@@ -555,9 +538,6 @@ func TestAuditRecordsActorAndRefundRestocks(t *testing.T) {
 	if sh.admin.identity()["holds"] != true {
 		t.Fatal("identity")
 	}
-	mgrEmail := fmt.Sprintf("mgr-%s@test.local", uuid.NewString()[:8])
-	sh.admin.addStaff(mgrEmail, "manager", sh.ikeja)
-	_ = mgrEmail
 }
 
 func TestAdjustmentCannotPassReserved(t *testing.T) {

@@ -66,27 +66,6 @@ func (s *Store) LockCustomer(ctx context.Context, tx pgx.Tx, merchantID, id uuid
 	return c, err
 }
 
-func (s *Store) ListCustomers(ctx context.Context, db DBTX, merchantID uuid.UUID) ([]Customer, error) {
-	rows, err := db.Query(ctx, `
-		SELECT id, merchant_id, name, phone, balance_minor, created_at
-		FROM customers WHERE merchant_id = $1
-		ORDER BY name
-	`, merchantID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []Customer
-	for rows.Next() {
-		c, err := scanCustomer(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, c)
-	}
-	return out, rows.Err()
-}
-
 // AddWalletBalance adds delta kobo. A negative delta that would pass zero is insufficient_wallet.
 func (s *Store) AddWalletBalance(ctx context.Context, tx pgx.Tx, merchantID, id uuid.UUID, delta int64) (int64, error) {
 	var bal int64

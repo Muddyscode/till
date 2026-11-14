@@ -31,7 +31,7 @@ func accountID(id *uuid.UUID) (uuid.UUID, error) {
 }
 
 func postPair(ctx context.Context, tx pgx.Tx, st *store.Store, merchantID uuid.UUID, desc string, debit, credit uuid.UUID, amount int64) error {
-	_, err := ledger.Post(ctx, tx, poster(st), ledger.PostRequest{
+	_, err := ledger.Post(ctx, tx, st.Poster(), ledger.PostRequest{
 		MerchantID:  merchantID,
 		Description: desc,
 		Lines: []ledger.Line{
@@ -281,7 +281,7 @@ func TopUp(ctx context.Context, tx pgx.Tx, st *store.Store, in TopUpInput) (stor
 	if err != nil {
 		return store.Customer{}, ledger.Journal{}, err
 	}
-	j, err := ledger.Post(ctx, tx, poster(st), ledger.PostRequest{
+	j, err := ledger.Post(ctx, tx, st.Poster(), ledger.PostRequest{
 		MerchantID:     in.Merchant.ID,
 		Description:    "wallet top-up " + c.Phone,
 		IdempotencyKey: in.IdempotencyKey,

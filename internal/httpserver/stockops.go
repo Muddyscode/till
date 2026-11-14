@@ -211,7 +211,7 @@ func (s *Server) settleTransfer(w http.ResponseWriter, r *http.Request, receive 
 		return err
 	})
 	if err != nil {
-		opsError(w, err)
+		writeLedgerError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, transferBody(done))

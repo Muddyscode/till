@@ -82,15 +82,15 @@ type apiClient struct {
 	t     *testing.T
 	srv   *httptest.Server
 	token string
+	pstk  string // id of the merchant's Paystack test connection
 }
 
 func startAPI(t *testing.T) *apiClient {
 	t.Helper()
 	st := store.New(testPool)
 	cfg := config.Config{
-		JWTSecret:      "test-secret-must-be-32-bytes-ok!",
-		PaystackSecret: "test-paystack-secret",
-		HoldMinutes:    15,
+		JWTSecret:   "test-secret-must-be-32-bytes-ok!",
+		HoldMinutes: 15,
 	}
 	api := httpserver.New(cfg, st, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	srv := httptest.NewServer(api.Router())
@@ -248,17 +248,16 @@ func (c *apiClient) postJournal(key string, body any) (*http.Response, map[strin
 	return res, out
 }
 
-func (c *apiClient) postTransfer(key, debit, credit string, amount int64, desc string) (*http.Response, map[string]any) {
+// postPair posts a two-line journal: debit one account, credit another.
+func (c *apiClient) postPair(key, debit, credit string, amount int64, desc string) (*http.Response, map[string]any) {
 	c.t.Helper()
-	h := http.Header{}
-	h.Set("Idempotency-Key", key)
-	res := c.do(http.MethodPost, "/v1/transfers", map[string]any{
-		"debit_account_id": debit, "credit_account_id": credit,
-		"amount_minor": amount, "description": desc,
-	}, h)
-	var out map[string]any
-	decode(c.t, res, &out)
-	return res, out
+	return c.postJournal(key, map[string]any{
+		"description": desc,
+		"postings": []map[string]any{
+			{"account_id": debit, "direction": "debit", "amount_minor": amount},
+			{"account_id": credit, "direction": "credit", "amount_minor": amount},
+		},
+	})
 }
 
 func (c *apiClient) identity() map[string]any {

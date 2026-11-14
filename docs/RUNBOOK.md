@@ -10,7 +10,8 @@ client --TLS--> reverse proxy (Caddy / nginx / cloud LB) --HTTP--> tilld :8080 -
 
 - **TLS terminates at the proxy.** `tilld` speaks plain HTTP. Never expose `:8080` to the internet. Redirect 80 to 443, enable HSTS at the proxy, and use TLS 1.2+.
 - Set `TILL_TRUST_PROXY=true` only when every request really passes through your proxy and the proxy appends the client address to `X-Forwarded-For`. Otherwise the login rate limiter sees every user as the proxy's IP.
-- Block `/metrics` from the public internet at the proxy. Scrape it from the private network. Probes: `/livez` (process is up), `/readyz` (database reachable, sweeper alive, not shutting down), `/v1/health` (legacy database ping).
+- Block `/metrics` from the public internet at the proxy. Scrape it from the private network. Probes: `/livez` (process is up), `/readyz` (database reachable, sweeper alive, not shutting down).
+- `POST /v1/webhooks/{connection_id}` is the one route providers call. It has no bearer token, so the proxy must let it through from the public internet. Do not put it behind basic auth or an IP allowlist unless the provider publishes its source addresses.
 - Use `sslmode=require` (or `verify-full`) in `TILL_DATABASE_URL` for any database that is not on the same host.
 - Run the container read-only if you can; it writes nothing to disk. Image: `docker build -t till .` (non-root, `Africa/Lagos` tzdata, port 8080).
 
@@ -22,15 +23,16 @@ client --TLS--> reverse proxy (Caddy / nginx / cloud LB) --HTTP--> tilld :8080 -
 | `TILL_DATABASE_URL` | required | pgx URL. |
 | `TILL_HTTP_ADDR` | `:8080` | |
 | `TILL_JWT_SECRET` | required | 32+ chars (48+ in production). Signs staff tokens. |
-| `TILL_PAYSTACK_SECRET` | required | 16+ chars (24+ in production). Verifies the webhook signature. |
 | `TILL_TOKEN_TTL` | `8h` | Go duration, `1m` to `720h`. |
 | `TILL_CORS_ORIGINS` | empty | Comma-separated exact origins. Empty means CORS is off. |
 | `TILL_TRUST_PROXY` | `false` | See above. |
 | `TILL_LOGIN_RATE_IP` / `TILL_LOGIN_RATE_EMAIL` | `30` / `6` | Attempts per minute. In memory, per instance: with N instances the effective limit is N times higher. The 10-failures-in-15-minutes lockout is stored in Postgres and is shared. |
-| `TILL_HOLD_MINUTES` | `15` | Transfer hold. |
+| `TILL_HOLD_MINUTES` | `15` | How long an order awaiting a transfer, card or tap payment holds its stock. |
 | `TILL_SEED`, `TILL_SEED_PASSWORD` | `false` | Demo data. Never in production. |
 
 Generate secrets with `openssl rand -base64 48`. Keep them in your platform's secret store, not in the image or the repository.
+
+Provider webhook secrets are not environment variables. Each payment connection holds its own, and Till stores it unencrypted in the `payment_connections` table. Treat the database and every backup of it as secret material.
 
 ## 3. First boot
 
@@ -66,17 +68,39 @@ Also take a logical dump weekly (`pg_dump -Fc`) as a second, version-independent
 1. Provision a scratch Postgres 16 instance. Never restore over production.
 2. Restore the newest base backup into its data directory, add `restore_command = 'cp /backups/wal/%f %p'` and `recovery_target_time = '<UTC time just before the incident>'` to `postgresql.conf`, create `recovery.signal`, start Postgres, wait for recovery to finish, then `SELECT pg_wal_replay_resume();` if it paused at target.
 3. Point a throwaway `tilld` at it and call `GET /v1/invariants` as an admin. It must report `"holds": true` (books balance, cached balances match the journal, wallet and stock agree).
-4. Spot check: the last order before the target time exists, and `GET /v1/reports/daily-sales` matches the previous day's printed Z-report or the Paystack dashboard.
+4. Spot check: the last order before the target time exists, and `GET /v1/reports/daily-sales` matches the previous day's printed Z-report, and each connection's `balance_minor` in `GET /v1/payment-connections` matches what you recorded from the provider dashboard that day.
 5. Record: time to restore, data lost (target time versus last good write), anything surprising. Update this runbook.
 
 ## 6. Key and secret rotation
 
 - **JWT secret.** Changing `TILL_JWT_SECRET` invalidates every session at once (everyone logs in again). Rotate: roll it out to all instances in one deploy, or accept a short window where old-secret instances reject new tokens. To revoke a single person instead, `POST /v1/auth/logout` as them or `POST /v1/staff/{id}/password-reset` as an admin (bumps `token_version`).
-- **Paystack secret.** Change it in the Paystack dashboard and in `TILL_PAYSTACK_SECRET` together. Webhooks signed with the old secret return 401 until both match; Paystack retries, and unmatched payments are visible afterwards.
+- **Provider webhook secret.** A connection's secret cannot be edited. Rotate it by replacing the connection:
+  1. As an admin, `POST /v1/payment-connections` with a new `code`, the same `provider`, and the provider's new signing secret (for provider `till`, leave `secret` out and copy the generated one from the response, which is shown once). Note the new `id`.
+  2. In the provider's dashboard, change the webhook URL to `https://<host>/v1/webhooks/<new id>` and the signing secret to the new one.
+  3. Send a test event or wait for a real payment and check that the new connection's `balance_minor` moves.
+  4. `DELETE /v1/payment-connections/{old id}`. A disabled connection answers 401 to every webhook. Its history and clearing balance stay, and you can still record settlements against it until the provider has paid out what it held.
+
+  Do not leave two active connections pointed at the same provider account. Events are deduplicated per connection, so the same payment delivered to both would be booked twice.
+- **Compromised connection secret.** Anyone holding it can post payments for that connection. Disable the connection first, then replace it as above. Review `GET /v1/unmatched-payments` and recent paid orders for payments you cannot match to a real sale.
 - **API keys.** Create the replacement (`POST /v1/api-keys`), deploy it to the integration, confirm `last_used_at` moves on the new key in `GET /v1/api-keys`, then `DELETE /v1/api-keys/{id}` the old one. Revocation is immediate. A leaked key: revoke first, investigate second; `GET /v1/audit` shows what its `staff_id` did.
 - **Database password.** Create a second role, switch `TILL_DATABASE_URL`, redeploy, drop the old role.
 
-## 7. Incident checklist
+## 7. Daily payment routine
+
+A manager or admin does this once a day, before the shops close their books.
+
+1. **Clear unmatched payments.** `GET /v1/unmatched-payments?status=open` (an admin may omit `outlet_id`, a manager passes one). Each row has a `reason`, the amount, the `connection_id` and `details` (payer name, bank, account, session id, method, reference). Money that matches no order, or two possible orders, is here too, so nothing is lost. For each one:
+   - If it belongs to a pending or expired order, `POST /v1/unmatched-payments/{id}/apply` with `{"order_id": "..."}` (the order id is optional when the row already names one). The amount must equal what the order is waiting for.
+   - If the customer should get the money back, `POST .../refund`. After the provider pays it out, `POST .../refunded`.
+   - Every call needs an `Idempotency-Key`. A row with no outlet can only be resolved by an admin.
+2. **Compare each connection with its provider.** `GET /v1/payment-connections` and read `balance_minor` for each one. It is what the provider still holds for the merchant: payments received, less fees, refund payouts and settlements. Compare it with the balance on the provider's dashboard. If they differ, the usual causes are:
+   - A payout to the bank that nobody recorded. Record it with `POST /v1/payment-connections/{id}/settlements` (`amount_minor`, `reference`).
+   - A payment the provider never delivered a webhook for. Record it with `POST /v1/payment-connections/{id}/payments`.
+   - Provider fees. Till books a fee only when the event carries one.
+   - A chargeback or reversal. Till does not post these. It writes `payment.reversed` to the audit log (`GET /v1/audit`) and leaves the books alone. Chargeback handling is not built. A free-form journal cannot touch the clearing account (`409 control_account`), so keep a note of the difference until the feature exists.
+3. **Check the books.** `GET /v1/invariants` must report `"holds": true`.
+
+## 8. Incident checklist
 
 1. **Is it up?** `curl /livez`, `curl /readyz`. `readyz` 503 tells you which check failed: `database`, `sweeper` (expired transfer holds are not being released; stock stays reserved), or `draining`.
 2. **Find the request.** Every response has `X-Request-ID`; every log line has `request_id`. Logs are JSON on stdout: `request` lines carry method, route, status, duration, merchant/staff/api-key ids; 5xx lines include `err`.
@@ -87,6 +111,6 @@ Also take a logical dump weekly (`pg_dump -Fc`) as a second, version-independent
 7. **Database failover:** `tilld` reconnects on its own through the pgx pool. Check `readyz` goes green, then run the invariants.
 8. **Afterwards:** write down the timeline, the request ids, what detected it, and one change that would have caught it sooner.
 
-## 8. Graceful shutdown and deploys
+## 9. Graceful shutdown and deploys
 
 On SIGTERM/SIGINT `tilld` flips `/readyz` to 503, stops accepting new connections, lets in-flight requests finish (up to 15 s), then stops the sweeper and waits for it. Set your orchestrator's termination grace period to 30 s or more, and have the load balancer use `/readyz`. Migrations run on boot; deploy one instance first when a release adds a migration.

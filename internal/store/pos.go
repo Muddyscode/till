@@ -207,7 +207,10 @@ func (s *Store) EnsureBooks(ctx context.Context, tx pgx.Tx, merchantID uuid.UUID
 		dest       **uuid.UUID
 	}
 	specs := []spec{
-		{"1100", "Paystack clearing", ledger.Asset, false, &m.ClearingAccountID},
+		// 1100 held provider money before payment connections (migration 0008).
+		// Each connection now has its own 1100-CODE account; this one only
+		// carries balances from before.
+		{"1100", "Payments clearing (before connections)", ledger.Asset, false, &m.ClearingAccountID},
 		{"1200", "Inventory", ledger.Asset, false, &m.InventoryAccountID},
 		{"2100", "VAT payable", ledger.Liability, false, &m.VATAccountID},
 		{"2150", "Goods received", ledger.Liability, false, &m.GoodsReceivedAccountID},
@@ -297,26 +300,6 @@ func (s *Store) GetStaffByID(ctx context.Context, db DBTX, id uuid.UUID) (Staff,
 		return Staff{}, ledger.Err(ledger.CodeNotFound, "staff not found")
 	}
 	return st, err
-}
-
-func (s *Store) ListStaff(ctx context.Context, db DBTX, merchantID uuid.UUID) ([]Staff, error) {
-	rows, err := db.Query(ctx, `
-		SELECT id, merchant_id, email, password_hash, role, disabled_at, created_at
-		FROM staff WHERE merchant_id = $1 ORDER BY created_at, email
-	`, merchantID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []Staff
-	for rows.Next() {
-		var st Staff
-		if err := rows.Scan(&st.ID, &st.MerchantID, &st.Email, &st.PasswordHash, &st.Role, &st.DisabledAt, &st.CreatedAt); err != nil {
-			return nil, err
-		}
-		out = append(out, st)
-	}
-	return out, rows.Err()
 }
 
 func (s *Store) CountActiveAdmins(ctx context.Context, db DBTX, merchantID uuid.UUID) (int, error) {
@@ -688,8 +671,8 @@ func (s *Store) NextReference(ctx context.Context, tx pgx.Tx, outletID uuid.UUID
 		return "", err
 	}
 	// Outlet codes repeat across merchants (every shop can have IKJ).
-	// The reference is globally unique because Paystack sends it back
-	// with no merchant id. The last 8 hex digits of a UUID v7 are random,
+	// The reference stays globally unique so a customer can quote it to any
+	// provider. The last 8 hex digits of a UUID v7 are random,
 	// so two Ikeja tills do not both mint IKJ-000001.
 	compact := strings.ReplaceAll(outletID.String(), "-", "")
 	tail := compact
@@ -822,64 +805,6 @@ func (s *Store) LockOrder(ctx context.Context, tx pgx.Tx, merchantID, orderID uu
 	return loaded[0], nil
 }
 
-func (s *Store) GetOrderByReference(ctx context.Context, db DBTX, reference string) (Order, error) {
-	row := db.QueryRow(ctx, `SELECT `+orderSelect+` FROM orders WHERE reference = $1`, reference)
-	o, err := scanOrder(row)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return Order{}, ledger.Err(ledger.CodeNotFound, "order not found")
-	}
-	if err != nil {
-		return Order{}, err
-	}
-	loaded, err := s.loadLines(ctx, db, []Order{o})
-	if err != nil {
-		return Order{}, err
-	}
-	return loaded[0], nil
-}
-
-func (s *Store) ListOrders(ctx context.Context, db DBTX, merchantID uuid.UUID, outletID *uuid.UUID, limit int) ([]Order, error) {
-	rows, err := db.Query(ctx, `
-		SELECT `+orderSelect+`
-		FROM orders
-		WHERE merchant_id = $1 AND ($2::uuid IS NULL OR outlet_id = $2)
-		ORDER BY created_at DESC
-		LIMIT $3
-	`, merchantID, outletID, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []Order
-	for rows.Next() {
-		o, err := scanOrder(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, o)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return s.loadLines(ctx, db, out)
-}
-
-func (s *Store) MarkRefunded(ctx context.Context, tx pgx.Tx, orderID, journalID, staffID uuid.UUID, reason string, at time.Time) error {
-	tag, err := tx.Exec(ctx, `
-		UPDATE orders
-		SET status = 'refunded', refund_journal_id = $2, refunded_by = $3, refund_reason = NULLIF($4, ''), refunded_at = $5,
-		    refunded_minor = total_minor
-		WHERE id = $1 AND status = 'paid'
-	`, orderID, journalID, staffID, reason, at)
-	if err != nil {
-		return err
-	}
-	if tag.RowsAffected() != 1 {
-		return ledger.Err(ledger.CodeInvalidOrder, "only a paid order can be refunded")
-	}
-	return nil
-}
-
 func (s *Store) MarkExpired(ctx context.Context, tx pgx.Tx, orderID uuid.UUID) error {
 	tag, err := tx.Exec(ctx, `UPDATE orders SET status = 'expired' WHERE id = $1 AND status = 'pending_payment'`, orderID)
 	if err != nil {
@@ -934,26 +859,19 @@ func (s *Store) SetReservationsStatus(ctx context.Context, tx pgx.Tx, orderID uu
 	return err
 }
 
-func (s *Store) InsertPayment(ctx context.Context, tx pgx.Tx, id, orderID uuid.UUID, method, status string, amount int64, provider string, eventID *string, journalID *uuid.UUID) error {
-	_, err := tx.Exec(ctx, `
-		INSERT INTO payments (id, order_id, method, status, amount_minor, provider, provider_event_id, journal_id)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-	`, id, orderID, method, status, amount, provider, eventID, journalID)
-	return err
-}
-
-func (s *Store) ConfirmPayment(ctx context.Context, tx pgx.Tx, orderID, journalID uuid.UUID, eventID *string) error {
-	tag, err := tx.Exec(ctx, `
-		UPDATE payments SET status = 'confirmed', journal_id = $2, provider_event_id = $3
+// ConfirmPayment marks the order's awaited tender confirmed, records which
+// connection delivered the money, and returns the tender's method.
+func (s *Store) ConfirmPayment(ctx context.Context, tx pgx.Tx, orderID, journalID uuid.UUID, eventID *string, connectionID *uuid.UUID, provider string) (string, error) {
+	var method string
+	err := tx.QueryRow(ctx, `
+		UPDATE payments SET status = 'confirmed', journal_id = $2, provider_event_id = $3, connection_id = $4, provider = $5
 		WHERE order_id = $1 AND status = 'pending'
-	`, orderID, journalID, eventID)
+		RETURNING method
+	`, orderID, journalID, eventID, connectionID, provider).Scan(&method)
 	if err != nil {
-		return err
+		return "", fmt.Errorf("confirm payment: %w", err)
 	}
-	if tag.RowsAffected() != 1 {
-		return fmt.Errorf("confirm payment: expected 1 row")
-	}
-	return nil
+	return method, nil
 }
 
 func (s *Store) InsertAudit(ctx context.Context, tx pgx.Tx, ev AuditEvent) error {
@@ -972,53 +890,6 @@ func (s *Store) InsertAudit(ctx context.Context, tx pgx.Tx, ev AuditEvent) error
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
 	`, ev.ID, ev.MerchantID, ev.StaffID, ev.Action, ev.EntityType, ev.EntityID, ev.OutletID, ev.Metadata)
 	return err
-}
-
-func (s *Store) ListAudit(ctx context.Context, db DBTX, merchantID uuid.UUID, outletID *uuid.UUID, limit int) ([]AuditEvent, error) {
-	rows, err := db.Query(ctx, `
-		SELECT id, merchant_id, staff_id, action, entity_type, entity_id, outlet_id, metadata, created_at
-		FROM audit_events
-		WHERE merchant_id = $1 AND ($2::uuid IS NULL OR outlet_id = $2)
-		ORDER BY created_at DESC
-		LIMIT $3
-	`, merchantID, outletID, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []AuditEvent
-	for rows.Next() {
-		var ev AuditEvent
-		if err := rows.Scan(&ev.ID, &ev.MerchantID, &ev.StaffID, &ev.Action, &ev.EntityType, &ev.EntityID, &ev.OutletID, &ev.Metadata, &ev.CreatedAt); err != nil {
-			return nil, err
-		}
-		out = append(out, ev)
-	}
-	return out, rows.Err()
-}
-
-func (s *Store) LockExpiredOrders(ctx context.Context, tx pgx.Tx, now time.Time, limit int) ([]Order, error) {
-	rows, err := tx.Query(ctx, `
-		SELECT `+orderSelect+`
-		FROM orders
-		WHERE status = 'pending_payment' AND expires_at < $1
-		ORDER BY id
-		LIMIT $2
-		FOR UPDATE SKIP LOCKED
-	`, now, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []Order
-	for rows.Next() {
-		o, err := scanOrder(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, o)
-	}
-	return out, rows.Err()
 }
 
 // ExpiredOrderIDs lists pending orders past their hold, oldest first, without

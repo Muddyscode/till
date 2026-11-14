@@ -14,8 +14,7 @@ const (
 	CodeTenderMismatch      = "tender_mismatch"
 	CodeRefundExceedsOrder  = "refund_exceeds_order"
 	maxDiscountReasonLength = 200
-	taxStandard, taxExempt  = "standard", "exempt"
-	taxZero                 = "zero"
+	taxStandard             = "standard"
 )
 
 // mulDiv is floor(a*b/c) without overflow. a, b >= 0 and c > 0.

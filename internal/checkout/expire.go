@@ -63,23 +63,6 @@ func releaseOne(ctx context.Context, tx pgx.Tx, st *store.Store, o store.Order) 
 	})
 }
 
-// ReleaseExpired releases up to 50 expired orders inside the caller's single
-// transaction. The sweeper itself uses SweepExpired (one transaction per order).
-func ReleaseExpired(ctx context.Context, tx pgx.Tx, st *store.Store, now time.Time) (int, error) {
-	orders, err := st.LockExpiredOrders(ctx, tx, now, sweepBatch)
-	if err != nil {
-		return 0, err
-	}
-	n := 0
-	for _, o := range orders {
-		if err := releaseOne(ctx, tx, st, o); err != nil {
-			return n, err
-		}
-		n++
-	}
-	return n, nil
-}
-
 // SweepExpired releases expired orders, each in its own transaction with
 // deadlock retry. An order that keeps failing is logged and added to failed so
 // it cannot block the rest of this sweep. It returns how many were released.

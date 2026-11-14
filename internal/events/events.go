@@ -54,20 +54,6 @@ func ValidType(t string) bool {
 	return false
 }
 
-// AllTypes lists every public type, sorted.
-func AllTypes() []string {
-	seen := map[string]bool{StockLow: true}
-	for _, v := range actionTypes {
-		seen[v] = true
-	}
-	out := make([]string, 0, len(seen))
-	for t := range seen {
-		out = append(out, t)
-	}
-	sort.Strings(out)
-	return out
-}
-
 // ActionsFor returns the audit actions behind the given public types. An empty
 // types list means every feed action.
 func ActionsFor(types []string) []string {

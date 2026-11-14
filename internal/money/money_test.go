@@ -62,18 +62,3 @@ func TestParseOptionalKoboAllowsZero(t *testing.T) {
 		}
 	}
 }
-
-func TestFormatNGN(t *testing.T) {
-	cases := map[int64]string{
-		0:       "₦0.00",
-		99:      "₦0.99",
-		100:     "₦1.00",
-		1234567: "₦12,345.67",
-		-5000:   "-₦50.00",
-	}
-	for in, want := range cases {
-		if got := FormatNGN(in); got != want {
-			t.Fatalf("FormatNGN(%d)=%q want %q", in, got, want)
-		}
-	}
-}

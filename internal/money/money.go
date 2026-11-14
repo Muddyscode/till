@@ -8,11 +8,6 @@ import (
 	"unicode"
 )
 
-const (
-	CurrencyNGN  = "NGN"
-	KoboPerNaira = int64(100)
-)
-
 // ParseJSONAmount accepts a JSON integer only (e.g. 5000).
 // Strings, floats, scientific notation, null, and non-positive values are rejected.
 func ParseJSONAmount(raw json.RawMessage) (int64, error) {
@@ -67,33 +62,4 @@ func ParseOptionalKobo(raw json.RawMessage) (int64, error) {
 		return 0, fmt.Errorf("amount must be >= 0")
 	}
 	return n, nil
-}
-
-func FormatNGN(kobo int64) string {
-	sign := ""
-	if kobo < 0 {
-		sign = "-"
-		kobo = -kobo
-	}
-	naira := kobo / KoboPerNaira
-	frac := kobo % KoboPerNaira
-	return fmt.Sprintf("%s₦%s.%02d", sign, withCommas(naira), frac)
-}
-
-func withCommas(n int64) string {
-	s := strconv.FormatInt(n, 10)
-	if len(s) <= 3 {
-		return s
-	}
-	var b strings.Builder
-	pre := len(s) % 3
-	if pre == 0 {
-		pre = 3
-	}
-	b.WriteString(s[:pre])
-	for i := pre; i < len(s); i += 3 {
-		b.WriteByte(',')
-		b.WriteString(s[i : i+3])
-	}
-	return b.String()
 }

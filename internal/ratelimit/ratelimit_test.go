@@ -40,7 +40,7 @@ func TestSweepBoundsMemory(t *testing.T) {
 	}
 	now = now.Add(time.Minute)
 	l.Allow("fresh")
-	if l.Len() > 2 {
-		t.Fatalf("refilled buckets should be swept, have %d", l.Len())
+	if len(l.buckets) > 2 {
+		t.Fatalf("refilled buckets should be swept, have %d", len(l.buckets))
 	}
 }
